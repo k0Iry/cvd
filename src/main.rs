@@ -1,200 +1,490 @@
+use anyhow::Result;
+use axum::extract::ws::{Message, WebSocket};
+use axum::{
+    extract::{Query, State, WebSocketUpgrade},
+    response::{IntoResponse, Json},
+    routing::get,
+    Router,
+};
 use futures::{SinkExt, StreamExt};
 use rand::Rng;
-use serde::Deserialize;
-use std::fs::OpenOptions;
-use std::io::Write;
+use serde::{Deserialize, Serialize};
+use std::{collections::VecDeque, net::SocketAddr, sync::Arc};
+use tokio::sync::{broadcast, RwLock};
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message;
+use tower_http::services::ServeDir;
 
-const WS_URL: &str = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade";
+const BINANCE_WS: &str = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade";
 
-// Binance aggTrade payload (fields we need)
 #[derive(Debug, Deserialize)]
 struct AggTrade {
     #[serde(rename = "e")]
     event_type: String,
-
-    #[serde(rename = "s")]
-    symbol: String,
-
-    #[serde(rename = "a")]
-    agg_trade_id: u64,
-
-    // price/qty are strings in Binance payload; parse to f64 ourselves
     #[serde(rename = "p")]
     price: String,
-
     #[serde(rename = "q")]
     quantity: String,
-
     #[serde(rename = "T")]
     trade_time: i64,
-
-    // true => buyer is maker => aggressive side is SELL (market sell)
     #[serde(rename = "m")]
     is_buyer_maker: bool,
 }
 
-fn parse_f64(s: &str) -> Option<f64> {
-    s.parse::<f64>().ok()
+#[derive(Debug, Clone, Serialize)]
+struct Bar {
+    // unix seconds, good for lightweight-charts
+    time: i64,
+    price_close: f64,
+    delta_usdt: f64,
+    cvd_usdt: f64,
+    trades: u64,
 }
 
-/// Compute signed delta from aggTrade:
-/// m=true  => market sell => -qty
-/// m=false => market buy  => +qty
-fn trade_delta(qty: f64, is_buyer_maker: bool) -> f64 {
-    if is_buyer_maker {
-        -qty
-    } else {
-        qty
+#[derive(Clone, Copy)]
+enum Tf {
+    M1,
+    M5,
+}
+impl Tf {
+    fn ms(self) -> i64 {
+        match self {
+            Tf::M1 => 60_000,
+            Tf::M5 => 300_000,
+        }
+    }
+    fn from_str(s: &str) -> Tf {
+        match s {
+            "5m" => Tf::M5,
+            _ => Tf::M1,
+        }
     }
 }
 
-/// Exponential backoff with jitter, capped.
-fn backoff_with_jitter(attempt: u32) -> Duration {
-    // base grows: 1s, 2s, 4s, 8s, ... up to 60s
-    let base_secs = (1u64 << attempt.min(6)) as u64; // 1..64
-    let capped = base_secs.min(60);
+#[derive(Debug, Clone)]
+struct BucketAgg {
+    cur_bucket_id: Option<i64>,
+    last_price: f64,
+    delta_usdt: f64,
+    trades: u64,
+}
+impl BucketAgg {
+    fn new() -> Self {
+        Self {
+            cur_bucket_id: None,
+            last_price: f64::NAN,
+            delta_usdt: 0.0,
+            trades: 0,
+        }
+    }
+}
 
-    // jitter: 0..250ms
-    let jitter_ms: u64 = rand::thread_rng().gen_range(0..=250);
+#[derive(Clone)]
+struct AppState {
+    hist_1m: Arc<RwLock<VecDeque<Bar>>>,
+    hist_5m: Arc<RwLock<VecDeque<Bar>>>,
+    tx_1m: broadcast::Sender<Bar>,
+    tx_5m: broadcast::Sender<Bar>,
+}
 
-    Duration::from_secs(capped) + Duration::from_millis(jitter_ms)
+#[derive(Deserialize)]
+struct Params {
+    tf: Option<String>,
+    limit: Option<usize>,
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    println!("Connecting to: {WS_URL}");
-    println!("Rule: m=true => market sell (-qty), m=false => market buy (+qty)");
-    println!("Writing: facts_1s.csv (append-only)\n");
+async fn main() -> Result<()> {
+    let (tx_1m, _) = broadcast::channel::<Bar>(2048);
+    let (tx_5m, _) = broadcast::channel::<Bar>(2048);
 
+    let state = AppState {
+        hist_1m: Arc::new(RwLock::new(VecDeque::with_capacity(4000))),
+        hist_5m: Arc::new(RwLock::new(VecDeque::with_capacity(4000))),
+        tx_1m,
+        tx_5m,
+    };
+
+    // spawn engine
+    tokio::spawn(engine_loop(state.clone()));
+
+    // axum app
+    let app = Router::new()
+        .route("/history", get(history))
+        .route("/ws", get(ws_upgrade))
+        // serve static UI (index.html) at /
+        .nest_service("/", ServeDir::new("static"))
+        .with_state(state);
+
+    let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+    println!("Open UI: http://{addr}/");
+    axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
+
+    Ok(())
+}
+
+async fn history(State(state): State<AppState>, Query(p): Query<Params>) -> impl IntoResponse {
+    let tf = Tf::from_str(p.tf.as_deref().unwrap_or("1m"));
+    let limit = p.limit.unwrap_or(500).min(2000);
+
+    let bars: Vec<Bar> = match tf {
+        Tf::M1 => {
+            let h = state.hist_1m.read().await;
+            h.iter()
+                .rev()
+                .take(limit)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect()
+        }
+        Tf::M5 => {
+            let h = state.hist_5m.read().await;
+            h.iter()
+                .rev()
+                .take(limit)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect()
+        }
+    };
+
+    Json(bars)
+}
+
+async fn ws_upgrade(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Query(p): Query<Params>,
+) -> impl IntoResponse {
+    let tf = Tf::from_str(p.tf.as_deref().unwrap_or("1m"));
+    ws.on_upgrade(move |socket| ws_handler(socket, state, tf))
+}
+
+async fn ws_handler(mut socket: WebSocket, state: AppState, tf: Tf) {
+    let mut rx = match tf {
+        Tf::M1 => state.tx_1m.subscribe(),
+        Tf::M5 => state.tx_5m.subscribe(),
+    };
+
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => {
+                match incoming {
+                    None => {
+                        // client disconnected
+                        break;
+                    }
+                    Some(Ok(Message::Close(_))) => {
+                        break;
+                    }
+                    Some(Ok(_)) => {
+                        // ignore other inbound messages
+                    }
+                    Some(Err(_e)) => {
+                        break;
+                    }
+                }
+            }
+
+            msg = rx.recv() => {
+                match msg {
+                    Ok(bar) => {
+                        let Ok(txt) = serde_json::to_string(&bar) else { continue; };
+                        if socket.send(Message::Text(txt)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // client fell behind; just continue
+                        continue;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+}
+
+async fn engine_loop(state: AppState) {
     let mut attempt: u32 = 0;
     loop {
-        match run_once().await {
+        match run_engine_once(&state).await {
             Ok(_) => attempt = 0,
-            Err(err) => eprintln!("run_once error: {err}"),
+            Err(e) => eprintln!("engine error: {e}"),
         }
-
         attempt = attempt.saturating_add(1);
         let wait = backoff_with_jitter(attempt);
         eprintln!(
-            "Reconnecting in {:.3}s (attempt={attempt})...",
-            wait.as_secs_f64()
+            "reconnecting in {:.3}s (attempt={})",
+            wait.as_secs_f64(),
+            attempt
         );
         sleep(wait).await;
     }
 }
 
-async fn run_once() -> anyhow::Result<()> {
-    // Open CSV in append mode
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("facts_1s.csv")?;
+#[derive(Debug, Clone)]
+struct SecAgg {
+    cur_sec: Option<i64>, // unix seconds
+    last_price: f64,
+    delta_usdt: f64,
+    trades: u64,
+}
 
-    // Write header if empty
-    if file.metadata()?.len() == 0 {
-        writeln!(
-            file,
-            "t_sec,t_end_ms,price_close,delta_btc_1s,delta_usdt_1s,cvd_btc,cvd_usdt,trades"
-        )?;
-        file.flush()?;
+impl SecAgg {
+    fn new() -> Self {
+        Self {
+            cur_sec: None,
+            last_price: f64::NAN,
+            delta_usdt: 0.0,
+            trades: 0,
+        }
     }
 
-    let (ws_stream, _resp) = connect_async(WS_URL).await?;
+    fn reset_to(&mut self, sec: i64, price: f64, delta_usdt: f64) {
+        self.cur_sec = Some(sec);
+        self.last_price = price;
+        self.delta_usdt = delta_usdt;
+        self.trades = 1;
+    }
+
+    fn add(&mut self, price: f64, delta_usdt: f64) {
+        self.last_price = price;
+        self.delta_usdt += delta_usdt;
+        self.trades += 1;
+    }
+}
+
+async fn flush_second(
+    state: &AppState,
+    a1: &mut BucketAgg,
+    a5: &mut BucketAgg,
+    cvd_closed_usdt: &mut f64,
+    sec_ended: i64,
+    sec_last_price: f64,
+    sec_delta_usdt: f64,
+    sec_trades: u64,
+) {
+    // end-of-second timestamp in ms (keeps it in correct minute)
+    let ts_ms_flush = sec_ended * 1000 + 999;
+
+    // 1m close-only (only when minute rolls)
+    if let Some(mut closed_bar_1m) =
+        push_bucket(a1, Tf::M1, ts_ms_flush, sec_last_price, sec_delta_usdt)
+    {
+        *cvd_closed_usdt += closed_bar_1m.delta_usdt;
+        closed_bar_1m.cvd_usdt = *cvd_closed_usdt;
+        push_publish(state, Tf::M1, closed_bar_1m).await; // history + ws
+    }
+
+    // 1m live (every second)
+    let tf_ms = Tf::M1.ms();
+    let cur_bucket_id = ts_ms_flush / tf_ms;
+    let cur_end_ms = (cur_bucket_id + 1) * tf_ms - 1;
+
+    let live_bar_1m = Bar {
+        time: cur_end_ms / 1000,
+        price_close: a1.last_price,
+        delta_usdt: a1.delta_usdt,
+        cvd_usdt: *cvd_closed_usdt + a1.delta_usdt,
+        trades: a1.trades, // 注意：现在是“秒tick数”，不是原始成交笔数
+    };
+    let _ = state.tx_1m.send(live_bar_1m);
+
+    // 5m close-only（可选）
+    if let Some(mut closed_bar_5m) =
+        push_bucket(a5, Tf::M5, ts_ms_flush, sec_last_price, sec_delta_usdt)
+    {
+        closed_bar_5m.cvd_usdt = *cvd_closed_usdt;
+        push_publish(state, Tf::M5, closed_bar_5m).await;
+    }
+
+    let _ = sec_trades; // 先占位，避免 unused warning（如果你暂时不用它）
+}
+
+async fn run_engine_once(state: &AppState) -> Result<()> {
+    let (ws_stream, _resp) = connect_async(BINANCE_WS).await?;
     let (mut write, mut read) = ws_stream.split();
 
-    // CVD state (cumulative since process start)
-    let mut cvd_btc: f64 = 0.0;
-    let mut cvd_usdt: f64 = 0.0;
+    // cumulative CVD for CLOSED 1m bars
+    let mut cvd_closed_usdt: f64 = 0.0;
 
-    // 1-second bucket state
-    let mut cur_sec: Option<i64> = None;
-    let mut sec_delta_btc: f64 = 0.0;
-    let mut sec_trades: u64 = 0;
-    let mut sec_last_price: f64 = 0.0;
+    // 1-second aggregator
+    let mut sec = SecAgg::new();
+
+    // 1m/5m bucket aggregators (but now they consume 1s-flushed events)
+    let mut a1 = BucketAgg::new();
+    let mut a5 = BucketAgg::new();
 
     while let Some(msg) = read.next().await {
         let msg = msg?;
 
         match msg {
-            Message::Ping(payload) => {
-                // Binance requires: pong with exact payload, asap
-                write.send(Message::Pong(payload)).await?;
+            tokio_tungstenite::tungstenite::Message::Ping(payload) => {
+                write
+                    .send(tokio_tungstenite::tungstenite::Message::Pong(payload))
+                    .await?;
             }
-            Message::Pong(_) => {}
-            Message::Text(txt) => {
-                let trade: AggTrade = match serde_json::from_str(&txt) {
-                    Ok(t) => t,
+            tokio_tungstenite::tungstenite::Message::Text(txt) => {
+                let t: AggTrade = match serde_json::from_str(&txt) {
+                    Ok(v) => v,
                     Err(_) => continue,
                 };
-                if trade.event_type != "aggTrade" {
+                if t.event_type != "aggTrade" {
                     continue;
                 }
 
-                let qty = match parse_f64(&trade.quantity) {
-                    Some(v) => v,
-                    None => continue,
+                let price: f64 = match t.price.parse() {
+                    Ok(v) => v,
+                    Err(_) => continue,
                 };
-                let price = match parse_f64(&trade.price) {
-                    Some(v) => v,
-                    None => continue,
+                let qty: f64 = match t.quantity.parse() {
+                    Ok(v) => v,
+                    Err(_) => continue,
                 };
 
-                let delta_btc = trade_delta(qty, trade.is_buyer_maker);
-                let sec = trade.trade_time / 1000;
+                // m=true => market sell => negative delta
+                let delta_btc = if t.is_buyer_maker { -qty } else { qty };
+                let delta_usdt = delta_btc * price;
 
-                // rollover check
-                match cur_sec {
+                let ts_ms = t.trade_time;
+                let this_sec = ts_ms / 1000;
+
+                match sec.cur_sec {
                     None => {
-                        cur_sec = Some(sec);
+                        sec.reset_to(this_sec, price, delta_usdt);
                     }
-                    Some(s) if s != sec => {
-                        // close previous second -> compute delta_usdt using last price of that second
-                        let sec_delta_usdt = sec_delta_btc * sec_last_price;
+                    Some(s) if s != this_sec => {
+                        // flush the finished second (s) into 1m/5m, then start new second
+                        let sec_ended = s;
+                        let sec_last_price = sec.last_price;
+                        let sec_delta = sec.delta_usdt;
+                        let sec_trades = sec.trades;
 
-                        // update cumulative CVD at second boundary
-                        cvd_btc += sec_delta_btc;
-                        cvd_usdt += sec_delta_usdt;
-
-                        // write one CSV row (append-only)
-                        let t_end_ms = (s + 1) * 1000 - 1;
-                        writeln!(
-                            file,
-                            "{},{},{:.2},{:+.8},{:+.2},{:+.8},{:+.2},{}",
-                            s,
-                            t_end_ms,
+                        flush_second(
+                            state,
+                            &mut a1,
+                            &mut a5,
+                            &mut cvd_closed_usdt,
+                            sec_ended,
                             sec_last_price,
-                            sec_delta_btc,
-                            sec_delta_usdt,
-                            cvd_btc,
-                            cvd_usdt,
-                            sec_trades
-                        )?;
-                        file.flush()?; // so python can tail reliably
+                            sec_delta,
+                            sec_trades,
+                        )
+                        .await;
 
-                        // reset for new second
-                        cur_sec = Some(sec);
-                        sec_delta_btc = 0.0;
-                        sec_trades = 0;
-                        // sec_last_price will be set below by current trade
+                        sec.reset_to(this_sec, price, delta_usdt);
                     }
-                    _ => {}
+                    _ => {
+                        // same second
+                        sec.add(price, delta_usdt);
+                    }
                 }
-
-                // accumulate into current second bucket
-                sec_delta_btc += delta_btc;
-                sec_trades += 1;
-                sec_last_price = price;
             }
-            Message::Close(frame) => {
-                eprintln!("WS closed by server: {:?}", frame);
-                break;
-            }
+            tokio_tungstenite::tungstenite::Message::Close(_) => break,
             _ => {}
         }
     }
 
-    Err(anyhow::anyhow!("ws stream ended"))
+    // flush last partial second (best-effort)
+    if let Some(s) = sec.cur_sec {
+        flush_second(
+            state,
+            &mut a1,
+            &mut a5,
+            &mut cvd_closed_usdt,
+            s,
+            sec.last_price,
+            sec.delta_usdt,
+            sec.trades,
+        )
+        .await;
+    }
+    Err(anyhow::anyhow!("ws ended"))
+}
+
+fn push_bucket(
+    agg: &mut BucketAgg,
+    tf: Tf,
+    ts_ms: i64,
+    price: f64,
+    delta_usdt: f64,
+) -> Option<Bar> {
+    let tf_ms = tf.ms();
+    let bucket_id = ts_ms / tf_ms;
+
+    match agg.cur_bucket_id {
+        None => agg.cur_bucket_id = Some(bucket_id),
+        Some(cur) if cur != bucket_id => {
+            // close previous bucket
+            if agg.trades == 0 || agg.last_price.is_nan() {
+                // defensive
+                agg.cur_bucket_id = Some(bucket_id);
+                agg.last_price = price;
+                agg.delta_usdt = delta_usdt;
+                agg.trades = 1;
+                return None;
+            }
+
+            let end_ms = (cur + 1) * tf_ms - 1;
+            let end_sec = end_ms / 1000;
+
+            let bar = Bar {
+                time: end_sec,
+                price_close: agg.last_price,
+                delta_usdt: agg.delta_usdt,
+                cvd_usdt: 0.0, // filled by caller
+                trades: agg.trades,
+            };
+
+            // start new bucket with current trade
+            agg.cur_bucket_id = Some(bucket_id);
+            agg.last_price = price;
+            agg.delta_usdt = delta_usdt;
+            agg.trades = 1;
+
+            return Some(bar);
+        }
+        _ => {}
+    }
+
+    // same bucket
+    agg.last_price = price;
+    agg.delta_usdt += delta_usdt;
+    agg.trades += 1;
+
+    None
+}
+
+async fn push_publish(state: &AppState, tf: Tf, bar: Bar) {
+    let max = 2000usize;
+
+    match tf {
+        Tf::M1 => {
+            let mut h = state.hist_1m.write().await;
+            if h.len() >= max {
+                h.pop_front();
+            }
+            h.push_back(bar.clone());
+            let _ = state.tx_1m.send(bar);
+        }
+        Tf::M5 => {
+            let mut h = state.hist_5m.write().await;
+            if h.len() >= max {
+                h.pop_front();
+            }
+            h.push_back(bar.clone());
+            let _ = state.tx_5m.send(bar);
+        }
+    }
+}
+
+fn backoff_with_jitter(attempt: u32) -> Duration {
+    let base = (1u64 << attempt.min(6)).min(60);
+    let jitter_ms: u64 = rand::thread_rng().gen_range(0..=250);
+    Duration::from_secs(base) + Duration::from_millis(jitter_ms)
 }

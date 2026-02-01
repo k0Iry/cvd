@@ -1,0 +1,191 @@
+<!doctype html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <title>CVD (Axum)</title>
+    <style>
+        body {
+            margin: 0;
+            background: #111;
+            color: #ddd;
+            font-family: sans-serif;
+        }
+
+        .bar {
+            padding: 8px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            border-bottom: 1px solid #222;
+        }
+
+        #wrap {
+            display: flex;
+            flex-direction: column;
+            height: calc(100vh - 46px);
+        }
+
+        #price {
+            flex: 2;
+        }
+
+        #cvd {
+            flex: 1;
+            border-top: 1px solid #333;
+        }
+
+        select {
+            background: #222;
+            color: #ddd;
+            border: 1px solid #444;
+            padding: 4px 8px;
+            border-radius: 6px;
+        }
+
+        .pill {
+            font-size: 12px;
+            padding: 2px 8px;
+            border: 1px solid #333;
+            border-radius: 999px;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="bar">
+        <div class="pill">Source: local axum</div>
+        <div>TF:</div>
+        <select id="tf">
+            <option value="1m">1m</option>
+            <option value="5m">5m</option>
+        </select>
+        <div id="status" class="pill">loading…</div>
+    </div>
+
+    <div id="wrap">
+        <div id="price"></div>
+        <div id="cvd"></div>
+    </div>
+
+    <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+    <script>
+        const tfSel = document.getElementById("tf");
+        const statusEl = document.getElementById("status");
+        const priceEl = document.getElementById("price");
+        const cvdEl = document.getElementById("cvd");
+
+        // 只用一个容器：#price
+        // 你可以把 #cvd 留着空着，或者后面删掉并把 #price flex:1 拉满
+        cvdEl.style.display = "none"; // 先隐藏第二个 pane，避免占空间
+
+        function mkChart(el) {
+            return LightweightCharts.createChart(el, {
+                layout: { background: { color: "#111" }, textColor: "#ddd" },
+                grid: { vertLines: { color: "#222" }, horzLines: { color: "#222" } },
+                timeScale: { borderColor: "#333", timeVisible: true },
+                rightPriceScale: { borderColor: "#333" },
+                leftPriceScale: { borderColor: "#333" },
+                crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+                width: el.clientWidth,
+                height: el.clientHeight,
+            });
+        }
+
+        const chart = mkChart(priceEl);
+
+        // 价格线：右轴
+        const priceSeries = chart.addLineSeries({
+            priceScaleId: "right",
+            lineWidth: 2,
+            color: "#f2c94c",              // 价格：偏黄
+            lastValueVisible: true,
+            priceLineVisible: true,
+        });
+
+        // CVD 线：左轴
+        const cvdSeries = chart.addLineSeries({
+            priceScaleId: "left",
+            lineWidth: 2,
+            color: "#56ccf2",
+            priceFormat: {
+                type: "custom",
+                formatter: (p) => {
+                    const abs = Math.abs(p);
+                    if (abs >= 1e9) return (p / 1e9).toFixed(2) + "B";
+                    if (abs >= 1e6) return (p / 1e6).toFixed(2) + "M";
+                    if (abs >= 1e3) return (p / 1e3).toFixed(2) + "K";
+                    return p.toFixed(0);
+                },
+            },
+        });
+
+        chart.priceScale('left').applyOptions({
+            visible: true,              // 👈 确保显示
+            borderVisible: true,
+            borderColor: '#333',
+            textColor: '#56ccf2',        // 刻度颜色和 CVD 一致
+            scaleMargins: {
+                top: 0.15,
+                bottom: 0.15,
+            },
+        });
+
+        // 让两条线视觉上更舒服一点
+        chart.priceScale("right").applyOptions({
+            textColor: "#f2c94c",
+            borderColor: "#333",
+        });
+
+        chart.priceScale("left").applyOptions({
+            textColor: "#56ccf2",
+            borderColor: "#333",
+        });
+
+        window.addEventListener("resize", () => {
+            chart.applyOptions({ width: priceEl.clientWidth, height: priceEl.clientHeight });
+        });
+
+        let ws;
+
+        async function loadHistory(tf) {
+            statusEl.textContent = "loading…";
+            const res = await fetch(`/history?tf=${tf}&limit=800`);
+            const bars = await res.json();
+
+            priceSeries.setData(bars.map(b => ({ time: b.time, value: b.price_close })));
+            cvdSeries.setData(bars.map(b => ({ time: b.time, value: b.cvd_usdt })));
+
+            // 可选：滚到最新
+            chart.timeScale().scrollToRealTime();
+            statusEl.textContent = "live";
+        }
+
+        function connectWs(tf) {
+            if (ws) ws.close();
+            const proto = location.protocol === "https:" ? "wss" : "ws";
+            ws = new WebSocket(`${proto}://${location.host}/ws?tf=${tf}`);
+
+            ws.onopen = () => statusEl.textContent = "live";
+            ws.onclose = () => statusEl.textContent = "disconnected";
+            ws.onerror = () => statusEl.textContent = "error";
+            ws.onmessage = (ev) => {
+                const b = JSON.parse(ev.data);
+                priceSeries.update({ time: b.time, value: b.price_close });
+                cvdSeries.update({ time: b.time, value: b.cvd_usdt });
+            };
+        }
+
+        async function reload() {
+            const tf = tfSel.value;
+            await loadHistory(tf);
+            connectWs(tf);
+        }
+
+        tfSel.addEventListener("change", reload);
+        reload();
+    </script>
+</body>
+
+</html>
