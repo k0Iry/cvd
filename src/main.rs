@@ -170,7 +170,8 @@ async fn main() -> Result<()> {
     let (tx_1m, _) = broadcast::channel::<Bar>(2048);
     let (tx_5m, _) = broadcast::channel::<Bar>(2048);
 
-    let opts = SqliteConnectOptions::from_str("sqlite:cvd.db")?.create_if_missing(true);
+    let db_url = std::env::var("SQLITE_URL").unwrap_or_else(|_| "sqlite:cvd.db".to_string());
+    let opts = SqliteConnectOptions::from_str(&db_url)?.create_if_missing(true);
 
     let db = SqlitePoolOptions::new()
         .max_connections(4)
@@ -203,7 +204,7 @@ async fn main() -> Result<()> {
         .nest_service("/", ServeDir::new("static"))
         .with_state(state);
 
-    let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+    let addr: SocketAddr = "0.0.0.0:8000".parse().unwrap();
     println!("Open UI: http://{addr}/");
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
 
