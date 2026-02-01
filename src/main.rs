@@ -9,6 +9,9 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+use std::str::FromStr;
 use std::{collections::VecDeque, net::SocketAddr, sync::Arc};
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::{sleep, Duration};
@@ -85,6 +88,18 @@ struct AppState {
     hist_5m: Arc<RwLock<VecDeque<Bar>>>,
     tx_1m: broadcast::Sender<Bar>,
     tx_5m: broadcast::Sender<Bar>,
+
+    db: SqlitePool,
+    cvd_closed_usdt: Arc<RwLock<f64>>, // <--- 新增：跨断线/重启保持
+}
+
+#[derive(sqlx::FromRow)]
+struct BarRow {
+    time: i64,
+    price_close: f64,
+    delta_usdt: f64,
+    cvd_usdt: f64,
+    trades: i64,
 }
 
 #[derive(Deserialize)]
@@ -93,16 +108,88 @@ struct Params {
     limit: Option<usize>,
 }
 
+async fn init_db(db: &SqlitePool) -> Result<()> {
+    sqlx::query("PRAGMA journal_mode=WAL;").execute(db).await?;
+    sqlx::query("PRAGMA synchronous=NORMAL;")
+        .execute(db)
+        .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS bars (
+            tf TEXT NOT NULL,
+            time INTEGER NOT NULL,
+            price_close REAL NOT NULL,
+            delta_usdt REAL NOT NULL,
+            cvd_usdt REAL NOT NULL,
+            trades INTEGER NOT NULL,
+            PRIMARY KEY (tf, time)
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
+async fn load_history(db: &SqlitePool, tf: &str, limit: usize) -> Result<(VecDeque<Bar>, f64)> {
+    let rows: Vec<BarRow> = sqlx::query_as(
+        r#"
+    SELECT time, price_close, delta_usdt, cvd_usdt, trades
+    FROM bars
+    WHERE tf = ?
+    ORDER BY time DESC
+    LIMIT ?
+    "#,
+    )
+    .bind(tf)
+    .bind(limit as i64)
+    .fetch_all(db)
+    .await?;
+
+    // rows are DESC -> reverse to ASC
+    let mut v: Vec<Bar> = rows
+        .into_iter()
+        .map(|r| Bar {
+            time: r.time,
+            price_close: r.price_close,
+            delta_usdt: r.delta_usdt,
+            cvd_usdt: r.cvd_usdt,
+            trades: r.trades as u64,
+        })
+        .collect();
+    v.reverse();
+
+    let last_cvd = v.last().map(|b| b.cvd_usdt).unwrap_or(0.0);
+    Ok((VecDeque::from(v), last_cvd))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let (tx_1m, _) = broadcast::channel::<Bar>(2048);
     let (tx_5m, _) = broadcast::channel::<Bar>(2048);
 
+    let opts = SqliteConnectOptions::from_str("sqlite:cvd.db")?.create_if_missing(true);
+
+    let db = SqlitePoolOptions::new()
+        .max_connections(4)
+        .connect_with(opts)
+        .await?;
+
+    init_db(&db).await?;
+
+    // 启动时从 DB 恢复历史（也会恢复 last_cvd）
+    let (hist_1m, last_cvd_1m) = load_history(&db, "1m", 2000).await?;
+    let (hist_5m, _last_cvd_5m) = load_history(&db, "5m", 2000).await?;
+
     let state = AppState {
-        hist_1m: Arc::new(RwLock::new(VecDeque::with_capacity(4000))),
-        hist_5m: Arc::new(RwLock::new(VecDeque::with_capacity(4000))),
+        hist_1m: Arc::new(RwLock::new(hist_1m)),
+        hist_5m: Arc::new(RwLock::new(hist_5m)),
         tx_1m,
         tx_5m,
+        db,
+        cvd_closed_usdt: Arc::new(RwLock::new(last_cvd_1m)),
     };
 
     // spawn engine
@@ -214,15 +301,17 @@ async fn engine_loop(state: AppState) {
     loop {
         match run_engine_once(&state).await {
             Ok(_) => attempt = 0,
-            Err(e) => eprintln!("engine error: {e}"),
+            Err(e) => {
+                if e.to_string().contains("ws ended") {
+                    attempt = 0; // 这是正常断开/结束
+                } else {
+                    eprintln!("engine error: {e}");
+                    attempt = attempt.saturating_add(1);
+                }
+            }
         }
-        attempt = attempt.saturating_add(1);
+
         let wait = backoff_with_jitter(attempt);
-        eprintln!(
-            "reconnecting in {:.3}s (attempt={})",
-            wait.as_secs_f64(),
-            attempt
-        );
         sleep(wait).await;
     }
 }
@@ -278,7 +367,11 @@ async fn flush_second(
     {
         *cvd_closed_usdt += closed_bar_1m.delta_usdt;
         closed_bar_1m.cvd_usdt = *cvd_closed_usdt;
-        push_publish(state, Tf::M1, closed_bar_1m).await; // history + ws
+
+        // 写回全局（跨断线/重启连续）
+        *state.cvd_closed_usdt.write().await = *cvd_closed_usdt;
+
+        push_publish(state, Tf::M1, closed_bar_1m).await;
     }
 
     // 1m live (every second)
@@ -311,7 +404,7 @@ async fn run_engine_once(state: &AppState) -> Result<()> {
     let (mut write, mut read) = ws_stream.split();
 
     // cumulative CVD for CLOSED 1m bars
-    let mut cvd_closed_usdt: f64 = 0.0;
+    let mut cvd_closed_usdt = *state.cvd_closed_usdt.read().await;
 
     // 1-second aggregator
     let mut sec = SecAgg::new();
@@ -463,6 +556,33 @@ fn push_bucket(
 async fn push_publish(state: &AppState, tf: Tf, bar: Bar) {
     let max = 2000usize;
 
+    let tf_str = match tf {
+        Tf::M1 => "1m",
+        Tf::M5 => "5m",
+    };
+
+    // 1) persist (UPSERT)
+    let _ = sqlx::query(
+        r#"
+    INSERT INTO bars (tf, time, price_close, delta_usdt, cvd_usdt, trades)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(tf, time) DO UPDATE SET
+        price_close=excluded.price_close,
+        delta_usdt=excluded.delta_usdt,
+        cvd_usdt=excluded.cvd_usdt,
+        trades=excluded.trades
+    "#,
+    )
+    .bind(tf_str)
+    .bind(bar.time)
+    .bind(bar.price_close)
+    .bind(bar.delta_usdt)
+    .bind(bar.cvd_usdt)
+    .bind(bar.trades as i64)
+    .execute(&state.db)
+    .await;
+
+    // 2) in-memory history + ws broadcast
     match tf {
         Tf::M1 => {
             let mut h = state.hist_1m.write().await;
