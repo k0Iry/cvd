@@ -55,11 +55,20 @@
 <body>
     <div class="bar">
         <div class="pill">Source: local axum</div>
+
+        <div>Market:</div>
+        <select id="market">
+            <option value="spot">spot</option>
+            <option value="usdm">usdm</option>
+            <option value="coinm">coinm</option>
+        </select>
+
         <div>TF:</div>
         <select id="tf">
             <option value="1m">1m</option>
             <option value="5m">5m</option>
         </select>
+
         <div id="status" class="pill">loading…</div>
     </div>
 
@@ -69,44 +78,47 @@
     </div>
 
     <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
-    <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
     <script>
+        const marketSel = document.getElementById("market");
         const tfSel = document.getElementById("tf");
         const statusEl = document.getElementById("status");
         const priceEl = document.getElementById("price");
         const cvdEl = document.getElementById("cvd");
 
-        // 只用一个容器：#price
-        // 你可以把 #cvd 留着空着，或者后面删掉并把 #price flex:1 拉满
-        cvdEl.style.display = "none"; // 先隐藏第二个 pane，避免占空间
-
         function mkChart(el) {
             return LightweightCharts.createChart(el, {
                 layout: { background: { color: "#111" }, textColor: "#ddd" },
                 grid: { vertLines: { color: "#222" }, horzLines: { color: "#222" } },
-                timeScale: { borderColor: "#333", timeVisible: true },
+                timeScale: {
+                    borderColor: "#333",
+                    timeVisible: true,
+                    secondsVisible: false,
+                    rightOffset: 2,
+                },
                 rightPriceScale: { borderColor: "#333" },
-                leftPriceScale: { borderColor: "#333" },
                 crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
                 width: el.clientWidth,
                 height: el.clientHeight,
+                // 允许滚轮/拖动缩放（横向）
+                handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: true },
+                handleScale: { mouseWheel: true, pinch: true, axisPressedMouseMove: true },
             });
         }
 
-        const chart = mkChart(priceEl);
+        // 上：价格；下：CVD
+        const priceChart = mkChart(priceEl);
+        const cvdChart = mkChart(cvdEl);
 
-        // 价格线：右轴
-        const priceSeries = chart.addLineSeries({
-            priceScaleId: "right",
+        // Price 线（右轴）
+        const priceSeries = priceChart.addLineSeries({
             lineWidth: 2,
-            color: "#f2c94c",              // 价格：偏黄
+            color: "#f2c94c",
             lastValueVisible: true,
             priceLineVisible: true,
         });
 
-        // CVD 线：左轴
-        const cvdSeries = chart.addLineSeries({
-            priceScaleId: "left",
+        // CVD 线（右轴即可；你要左轴也可以，但一般下面 pane 用右轴更直观）
+        const cvdSeries = cvdChart.addLineSeries({
             lineWidth: 2,
             color: "#56ccf2",
             priceFormat: {
@@ -121,69 +133,110 @@
             },
         });
 
-        chart.priceScale('left').applyOptions({
-            visible: true,              // 👈 确保显示
-            borderVisible: true,
-            borderColor: '#333',
-            textColor: '#56ccf2',        // 刻度颜色和 CVD 一致
-            scaleMargins: {
-                top: 0.15,
-                bottom: 0.15,
-            },
-        });
+        // 让下方 CVD 的右轴文字颜色和线一致
+        cvdChart.priceScale("right").applyOptions({ textColor: "#56ccf2", borderColor: "#333" });
+        priceChart.priceScale("right").applyOptions({ textColor: "#f2c94c", borderColor: "#333" });
 
-        // 让两条线视觉上更舒服一点
-        chart.priceScale("right").applyOptions({
-            textColor: "#f2c94c",
-            borderColor: "#333",
-        });
+        // resize
+        function resize() {
+            priceChart.applyOptions({ width: priceEl.clientWidth, height: priceEl.clientHeight });
+            cvdChart.applyOptions({ width: cvdEl.clientWidth, height: cvdEl.clientHeight });
+        }
+        window.addEventListener("resize", resize);
 
-        chart.priceScale("left").applyOptions({
-            textColor: "#56ccf2",
-            borderColor: "#333",
-        });
+        // ---------------------------
+        // ✅ timeScale 同步（核心）
+        // ---------------------------
+        let syncing = false;
 
-        window.addEventListener("resize", () => {
-            chart.applyOptions({ width: priceEl.clientWidth, height: priceEl.clientHeight });
-        });
+        function syncTimeScale(fromChart, toChart) {
+            fromChart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+                if (!range) return;
+                if (syncing) return;
+                syncing = true;
+                toChart.timeScale().setVisibleLogicalRange(range);
+                syncing = false;
+            });
+        }
 
+        syncTimeScale(priceChart, cvdChart);
+        syncTimeScale(cvdChart, priceChart);
+
+        // ---------------------------
+        // ✅ crosshair 同步（可选但非常爽）
+        // ---------------------------
+        function getSeriesPrice(param, series) {
+            const p = param.seriesPrices.get(series);
+            if (p == null) return null;
+            // lineSeries 返回 number
+            return typeof p === "number" ? p : null;
+        }
+
+        function syncCrosshair(srcChart, dstChart, srcSeries, dstSeries) {
+            srcChart.subscribeCrosshairMove((param) => {
+                if (!param || param.time === undefined) {
+                    dstChart.clearCrosshairPosition();
+                    return;
+                }
+                const price = getSeriesPrice(param, srcSeries);
+                // 这个 price 只用于让目标图十字光标有个 y 位置
+                // 如果拿不到就只同步 time
+                if (price == null) {
+                    dstChart.setCrosshairPosition(0, param.time, dstSeries);
+                } else {
+                    dstChart.setCrosshairPosition(price, param.time, dstSeries);
+                }
+            });
+        }
+
+        syncCrosshair(priceChart, cvdChart, priceSeries, cvdSeries);
+        syncCrosshair(cvdChart, priceChart, cvdSeries, priceSeries);
+
+        // ---------------------------
+        // 数据加载与 WS
+        // ---------------------------
         let ws;
 
-        async function loadHistory(tf) {
+        async function loadHistory(market, tf) {
             statusEl.textContent = "loading…";
-            const res = await fetch(`/history?tf=${tf}&limit=800`);
+            const res = await fetch(`/history?market=${market}&tf=${tf}&limit=800`);
             const bars = await res.json();
 
             priceSeries.setData(bars.map(b => ({ time: b.time, value: b.price_close })));
             cvdSeries.setData(bars.map(b => ({ time: b.time, value: b.cvd_usdt })));
 
-            // 可选：滚到最新
-            chart.timeScale().scrollToRealTime();
+            // 两张图都滚到最新（因为 timeScale 同步，滚一个也行）
+            priceChart.timeScale().scrollToRealTime();
             statusEl.textContent = "live";
         }
 
-        function connectWs(tf) {
+        function connectWs(market, tf) {
             if (ws) ws.close();
             const proto = location.protocol === "https:" ? "wss" : "ws";
-            ws = new WebSocket(`${proto}://${location.host}/ws?tf=${tf}`);
+            ws = new WebSocket(`${proto}://${location.host}/ws?market=${market}&tf=${tf}`);
 
             ws.onopen = () => statusEl.textContent = "live";
             ws.onclose = () => statusEl.textContent = "disconnected";
             ws.onerror = () => statusEl.textContent = "error";
+
             ws.onmessage = (ev) => {
                 const b = JSON.parse(ev.data);
+                // 更新两张图（time 一样就会对齐）
                 priceSeries.update({ time: b.time, value: b.price_close });
                 cvdSeries.update({ time: b.time, value: b.cvd_usdt });
             };
         }
 
         async function reload() {
+            const market = marketSel.value;
             const tf = tfSel.value;
-            await loadHistory(tf);
-            connectWs(tf);
+            await loadHistory(market, tf);
+            connectWs(market, tf);
         }
 
+        marketSel.addEventListener("change", reload);
         tfSel.addEventListener("change", reload);
+
         reload();
     </script>
 </body>
