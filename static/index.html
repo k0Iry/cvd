@@ -205,10 +205,19 @@
         syncCrosshair(priceChart, cvdChart, priceSeries, cvdSeries);
         syncCrosshair(cvdChart, priceChart, cvdSeries, priceSeries);
 
-        // ---------------------------
         // 数据加载与 WS
         // ---------------------------
-        let ws;
+        let ws = null;
+
+        // retry state
+        let wsRetryTimer = null;
+        let wsRetryAttempt = 0;
+
+        // “我当前想要的连接目标”，用于避免旧连接回调污染
+        let wsWant = { market: null, tf: null };
+
+        // 防乱序：记录最后一次更新时间（每次 reload 会重置）
+        let lastWsTime = 0;
 
         async function loadHistory(market, tf) {
             statusEl.textContent = "loading…";
@@ -224,20 +233,111 @@
         }
 
         function connectWs(market, tf) {
-            if (ws) ws.close();
-            const proto = location.protocol === "https:" ? "wss" : "ws";
-            ws = new WebSocket(`${proto}://${location.host}/ws?market=${market}&tf=${tf}`);
+            wsWant = { market, tf };
+            lastWsTime = 0;
 
-            ws.onopen = () => statusEl.textContent = "live";
-            ws.onclose = () => statusEl.textContent = "disconnected";
-            ws.onerror = () => statusEl.textContent = "error";
+            // 取消待重连
+            if (wsRetryTimer) {
+                clearTimeout(wsRetryTimer);
+                wsRetryTimer = null;
+            }
+
+            // 关闭旧连接（并断开旧回调）
+            if (ws) {
+                try { ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null; } catch { }
+                try { ws.close(); } catch { }
+                ws = null;
+            }
+
+            const proto = location.protocol === "https:" ? "wss" : "ws";
+            const url = `${proto}://${location.host}/ws?market=${market}&tf=${tf}`;
+
+            statusEl.textContent = "connecting…";
+
+            try {
+                ws = new WebSocket(url);
+            } catch (e) {
+                scheduleReconnect(market, tf);
+                return;
+            }
+
+            ws.onopen = async () => {
+                // 如果用户已经切走了，立刻关掉这条连接
+                if (wsWant.market !== market || wsWant.tf !== tf) {
+                    try { ws.close(); } catch { }
+                    return;
+                }
+
+                // ✅ 连上就清空退避计数
+                wsRetryAttempt = 0;
+                statusEl.textContent = "live";
+
+                // ✅ 关键：重连成功后补一次 history（把断线期间的 bar 补齐）
+                // 这一步会让公网偶发断线“几乎无感”
+                try {
+                    await loadHistory(market, tf);
+                } catch (_) {
+                    // ignore
+                }
+            };
+
+            ws.onclose = () => {
+                if (wsWant.market !== market || wsWant.tf !== tf) return;
+                statusEl.textContent = "disconnected";
+                scheduleReconnect(market, tf);
+            };
+
+            ws.onerror = () => {
+                // 有些浏览器先 onerror 再 onclose；这里不 schedule，避免双触发
+                if (wsWant.market !== market || wsWant.tf !== tf) return;
+                statusEl.textContent = "error";
+            };
 
             ws.onmessage = (ev) => {
-                const b = JSON.parse(ev.data);
+                if (wsWant.market !== market || wsWant.tf !== tf) return;
+
+                let b;
+                try {
+                    b = JSON.parse(ev.data);
+                } catch {
+                    return; // bad frame
+                }
+
+                // 防乱序：time 比上次小就丢弃（避免 chart update 抽风）
+                if (typeof b.time !== "number") return;
+                if (b.time < lastWsTime) return;
+                lastWsTime = b.time;
+
                 // 更新两张图（time 一样就会对齐）
-                priceSeries.update({ time: b.time, value: b.price_close });
-                cvdSeries.update({ time: b.time, value: b.cvd_usdt });
+                if (typeof b.price_close === "number") {
+                    priceSeries.update({ time: b.time, value: b.price_close });
+                }
+                if (typeof b.cvd_usdt === "number") {
+                    cvdSeries.update({ time: b.time, value: b.cvd_usdt });
+                }
             };
+        }
+
+        function scheduleReconnect(market, tf) {
+            if (wsRetryTimer) return;
+
+            wsRetryAttempt += 1;
+
+            // 指数退避：0.5s, 1s, 2s, 4s, 8s... 上限 20s
+            const base = Math.min(20000, 500 * Math.pow(2, Math.min(wsRetryAttempt, 6)));
+            const jitter = Math.floor(Math.random() * 400); // 0~400ms
+            const delay = base + jitter;
+
+            statusEl.textContent = `reconnect in ${(delay / 1000).toFixed(1)}s…`;
+
+            wsRetryTimer = setTimeout(() => {
+                wsRetryTimer = null;
+
+                // 只有当前选择还没变才重连
+                if (wsWant.market === market && wsWant.tf === tf) {
+                    connectWs(market, tf);
+                }
+            }, delay);
         }
 
         async function reload() {
