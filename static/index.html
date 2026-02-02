@@ -56,6 +56,12 @@
     <div class="bar">
         <div class="pill">Source: local axum</div>
 
+        <div>Venue:</div>
+        <select id="venue">
+            <option value="binance" selected>binance</option>
+            <option value="coinbase">coinbase</option>
+        </select>
+
         <div>Symbol:</div>
         <select id="symbol">
             <option value="BTC">BTC</option>
@@ -97,12 +103,25 @@
 
     <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
     <script>
+        const venueSel = document.getElementById("venue");
+
+        // 当前页面路径里已经包含 /binance/，保持一致
+        venueSel.addEventListener("change", () => {
+            const v = venueSel.value;
+            if (v === "coinbase") {
+                // 保留 query（可选），最简单直接跳
+                window.location.href = "/coinbase/";
+            }
+        });
         const symbolSel = document.getElementById("symbol");
         const marketSel = document.getElementById("market");
         const tfSel = document.getElementById("tf");
         const statusEl = document.getElementById("status");
         const priceEl = document.getElementById("price");
         const cvdEl = document.getElementById("cvd");
+
+        const BASE = location.pathname.split('/')[1]; // "coinbase" or "binance"
+        const API = `/${BASE}`;
 
         function mkChart(el) {
             return LightweightCharts.createChart(el, {
@@ -260,7 +279,7 @@
 
         async function loadHistory(symbol, market, tf) {
             statusEl.textContent = "loading…";
-            const res = await fetch(`/history?symbol=${encodeURIComponent(symbol)}&market=${encodeURIComponent(market)}&tf=${encodeURIComponent(tf)}&limit=800`);
+            const res = await fetch(`${API}/history?symbol=${encodeURIComponent(symbol)}&market=${encodeURIComponent(market)}&tf=${encodeURIComponent(tf)}&limit=800`);
             const bars = await res.json();
 
             priceSeries.setData(bars.map(b => ({ time: b.time, value: b.price_close })));
@@ -288,7 +307,7 @@
             }
 
             const proto = location.protocol === "https:" ? "wss" : "ws";
-            const url = `${proto}://${location.host}/ws?symbol=${encodeURIComponent(symbol)}&market=${encodeURIComponent(market)}&tf=${encodeURIComponent(tf)}`;
+            const url = `${proto}://${location.host}${API}/ws?symbol=${encodeURIComponent(symbol)}&market=${encodeURIComponent(market)}&tf=${encodeURIComponent(tf)}`;
 
             statusEl.textContent = "connecting…";
 
