@@ -78,6 +78,15 @@
             <option value="5m">5m</option>
         </select>
 
+        <div>Timezone:</div>
+        <select id="tz">
+            <option value="local">Local</option>
+            <option value="UTC">UTC</option>
+            <option value="Asia/Shanghai">Beijing</option>
+            <option value="America/New_York">New York</option>
+            <option value="Europe/London">London</option>
+        </select>
+
         <div id="status" class="pill">loading…</div>
     </div>
 
@@ -117,6 +126,44 @@
         // 上：价格；下：CVD
         const priceChart = mkChart(priceEl);
         const cvdChart = mkChart(cvdEl);
+
+        const tzSel = document.getElementById("tz");
+        let currentTz = tzSel.value;
+
+        // unix seconds -> formatted string
+        function formatTime(sec, tz) {
+            const d = new Date(sec * 1000);
+            return new Intl.DateTimeFormat("en-GB", {
+                timeZone: tz === "local" ? undefined : tz,
+                month: "2-digit",
+                day: "2-digit",
+                hour: "2-digit",
+                minute: "2-digit",
+            }).format(d);
+        }
+
+        function applyTimeFormatter(chart) {
+            chart.applyOptions({
+                timeScale: {
+                    tickMarkFormatter: (time) => {
+                        if (typeof time !== "number") return "";
+                        return formatTime(time, currentTz);
+                    },
+                },
+            });
+        }
+
+        // 初始应用
+        applyTimeFormatter(priceChart);
+        applyTimeFormatter(cvdChart);
+
+        tzSel.addEventListener("change", () => {
+            currentTz = tzSel.value;
+
+            // 只刷新显示，不动 series 数据
+            applyTimeFormatter(priceChart);
+            applyTimeFormatter(cvdChart);
+        });
 
         const priceSeries = priceChart.addLineSeries({
             lineWidth: 2,
