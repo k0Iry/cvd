@@ -166,10 +166,22 @@
         // ✅ crosshair 同步（可选但非常爽）
         // ---------------------------
         function getSeriesPrice(param, series) {
-            const p = param.seriesPrices.get(series);
-            if (p == null) return null;
-            // lineSeries 返回 number
-            return typeof p === "number" ? p : null;
+            const sp = param && param.seriesPrices;
+            if (!sp) return null;
+
+            // Map-like
+            if (typeof sp.get === "function") {
+                const v = sp.get(series);
+                return typeof v === "number" ? v : null;
+            }
+
+            // Object-like (rare, but guard anyway)
+            try {
+                const v = sp[series];
+                return typeof v === "number" ? v : null;
+            } catch {
+                return null;
+            }
         }
 
         function syncCrosshair(srcChart, dstChart, srcSeries, dstSeries) {
@@ -178,11 +190,12 @@
                     dstChart.clearCrosshairPosition();
                     return;
                 }
+
                 const price = getSeriesPrice(param, srcSeries);
-                // 这个 price 只用于让目标图十字光标有个 y 位置
-                // 如果拿不到就只同步 time
+
+                // ✅ 不要 setCrosshairPosition(0, ...) —— 0 可能导致奇怪的 scale 行为
                 if (price == null) {
-                    dstChart.setCrosshairPosition(0, param.time, dstSeries);
+                    dstChart.setCrosshairPosition(NaN, param.time, dstSeries);
                 } else {
                     dstChart.setCrosshairPosition(price, param.time, dstSeries);
                 }
