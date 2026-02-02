@@ -56,6 +56,15 @@
     <div class="bar">
         <div class="pill">Source: local axum</div>
 
+        <div>Symbol:</div>
+        <select id="symbol">
+            <option value="BTC">BTC</option>
+            <option value="ETH">ETH</option>
+            <option value="SOL">SOL</option>
+            <option value="BNB">BNB</option>
+            <option value="AAVE">AAVE</option>
+        </select>
+
         <div>Market:</div>
         <select id="market">
             <option value="spot">spot</option>
@@ -79,6 +88,7 @@
 
     <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
     <script>
+        const symbolSel = document.getElementById("symbol");
         const marketSel = document.getElementById("market");
         const tfSel = document.getElementById("tf");
         const statusEl = document.getElementById("status");
@@ -99,7 +109,6 @@
                 crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
                 width: el.clientWidth,
                 height: el.clientHeight,
-                // 允许滚轮/拖动缩放（横向）
                 handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: true },
                 handleScale: { mouseWheel: true, pinch: true, axisPressedMouseMove: true },
             });
@@ -109,7 +118,6 @@
         const priceChart = mkChart(priceEl);
         const cvdChart = mkChart(cvdEl);
 
-        // Price 线（右轴）
         const priceSeries = priceChart.addLineSeries({
             lineWidth: 2,
             color: "#f2c94c",
@@ -117,7 +125,6 @@
             priceLineVisible: true,
         });
 
-        // CVD 线（右轴即可；你要左轴也可以，但一般下面 pane 用右轴更直观）
         const cvdSeries = cvdChart.addLineSeries({
             lineWidth: 2,
             color: "#56ccf2",
@@ -133,22 +140,17 @@
             },
         });
 
-        // 让下方 CVD 的右轴文字颜色和线一致
         cvdChart.priceScale("right").applyOptions({ textColor: "#56ccf2", borderColor: "#333" });
         priceChart.priceScale("right").applyOptions({ textColor: "#f2c94c", borderColor: "#333" });
 
-        // resize
         function resize() {
             priceChart.applyOptions({ width: priceEl.clientWidth, height: priceEl.clientHeight });
             cvdChart.applyOptions({ width: cvdEl.clientWidth, height: cvdEl.clientHeight });
         }
         window.addEventListener("resize", resize);
 
-        // ---------------------------
-        // ✅ timeScale 同步（核心）
-        // ---------------------------
+        // ✅ timeScale 同步
         let syncing = false;
-
         function syncTimeScale(fromChart, toChart) {
             fromChart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
                 if (!range) return;
@@ -158,24 +160,17 @@
                 syncing = false;
             });
         }
-
         syncTimeScale(priceChart, cvdChart);
         syncTimeScale(cvdChart, priceChart);
 
-        // ---------------------------
-        // ✅ crosshair 同步（可选但非常爽）
-        // ---------------------------
+        // ✅ crosshair 同步（保留你原版）
         function getSeriesPrice(param, series) {
             const sp = param && param.seriesPrices;
             if (!sp) return null;
-
-            // Map-like
             if (typeof sp.get === "function") {
                 const v = sp.get(series);
                 return typeof v === "number" ? v : null;
             }
-
-            // Object-like (rare, but guard anyway)
             try {
                 const v = sp[series];
                 return typeof v === "number" ? v : null;
@@ -190,10 +185,7 @@
                     dstChart.clearCrosshairPosition();
                     return;
                 }
-
                 const price = getSeriesPrice(param, srcSeries);
-
-                // ✅ 不要 setCrosshairPosition(0, ...) —— 0 可能导致奇怪的 scale 行为
                 if (price == null) {
                     dstChart.setCrosshairPosition(NaN, param.time, dstSeries);
                 } else {
@@ -201,11 +193,11 @@
                 }
             });
         }
-
         syncCrosshair(priceChart, cvdChart, priceSeries, cvdSeries);
         syncCrosshair(cvdChart, priceChart, cvdSeries, priceSeries);
 
-        // 数据加载与 WS
+        // ---------------------------
+        // 数据加载与 WS（带 retry）
         // ---------------------------
         let ws = null;
 
@@ -213,27 +205,26 @@
         let wsRetryTimer = null;
         let wsRetryAttempt = 0;
 
-        // “我当前想要的连接目标”，用于避免旧连接回调污染
-        let wsWant = { market: null, tf: null };
+        // 当前想要的连接目标（避免旧连接回调污染）
+        let wsWant = { symbol: null, market: null, tf: null };
 
-        // 防乱序：记录最后一次更新时间（每次 reload 会重置）
+        // 防乱序：记录最后一次更新时间
         let lastWsTime = 0;
 
-        async function loadHistory(market, tf) {
+        async function loadHistory(symbol, market, tf) {
             statusEl.textContent = "loading…";
-            const res = await fetch(`/history?market=${market}&tf=${tf}&limit=800`);
+            const res = await fetch(`/history?symbol=${encodeURIComponent(symbol)}&market=${encodeURIComponent(market)}&tf=${encodeURIComponent(tf)}&limit=800`);
             const bars = await res.json();
 
             priceSeries.setData(bars.map(b => ({ time: b.time, value: b.price_close })));
             cvdSeries.setData(bars.map(b => ({ time: b.time, value: b.cvd_usdt })));
 
-            // 两张图都滚到最新（因为 timeScale 同步，滚一个也行）
             priceChart.timeScale().scrollToRealTime();
             statusEl.textContent = "live";
         }
 
-        function connectWs(market, tf) {
-            wsWant = { market, tf };
+        function connectWs(symbol, market, tf) {
+            wsWant = { symbol, market, tf };
             lastWsTime = 0;
 
             // 取消待重连
@@ -250,65 +241,51 @@
             }
 
             const proto = location.protocol === "https:" ? "wss" : "ws";
-            const url = `${proto}://${location.host}/ws?market=${market}&tf=${tf}`;
+            const url = `${proto}://${location.host}/ws?symbol=${encodeURIComponent(symbol)}&market=${encodeURIComponent(market)}&tf=${encodeURIComponent(tf)}`;
 
             statusEl.textContent = "connecting…";
 
             try {
                 ws = new WebSocket(url);
-            } catch (e) {
-                scheduleReconnect(market, tf);
+            } catch (_) {
+                scheduleReconnect(symbol, market, tf);
                 return;
             }
 
             ws.onopen = async () => {
-                // 如果用户已经切走了，立刻关掉这条连接
-                if (wsWant.market !== market || wsWant.tf !== tf) {
+                if (wsWant.symbol !== symbol || wsWant.market !== market || wsWant.tf !== tf) {
                     try { ws.close(); } catch { }
                     return;
                 }
-
-                // ✅ 连上就清空退避计数
                 wsRetryAttempt = 0;
                 statusEl.textContent = "live";
 
-                // ✅ 关键：重连成功后补一次 history（把断线期间的 bar 补齐）
-                // 这一步会让公网偶发断线“几乎无感”
-                try {
-                    await loadHistory(market, tf);
-                } catch (_) {
-                    // ignore
-                }
+                // ✅ 重连成功后补一次 history（补齐断线期间 bar）
+                try { await loadHistory(symbol, market, tf); } catch { }
             };
 
             ws.onclose = () => {
-                if (wsWant.market !== market || wsWant.tf !== tf) return;
+                if (wsWant.symbol !== symbol || wsWant.market !== market || wsWant.tf !== tf) return;
                 statusEl.textContent = "disconnected";
-                scheduleReconnect(market, tf);
+                scheduleReconnect(symbol, market, tf);
             };
 
             ws.onerror = () => {
-                // 有些浏览器先 onerror 再 onclose；这里不 schedule，避免双触发
-                if (wsWant.market !== market || wsWant.tf !== tf) return;
+                // 避免 onerror + onclose 双 schedule（让 onclose 来做）
+                if (wsWant.symbol !== symbol || wsWant.market !== market || wsWant.tf !== tf) return;
                 statusEl.textContent = "error";
             };
 
             ws.onmessage = (ev) => {
-                if (wsWant.market !== market || wsWant.tf !== tf) return;
+                if (wsWant.symbol !== symbol || wsWant.market !== market || wsWant.tf !== tf) return;
 
                 let b;
-                try {
-                    b = JSON.parse(ev.data);
-                } catch {
-                    return; // bad frame
-                }
+                try { b = JSON.parse(ev.data); } catch { return; }
 
-                // 防乱序：time 比上次小就丢弃（避免 chart update 抽风）
                 if (typeof b.time !== "number") return;
                 if (b.time < lastWsTime) return;
                 lastWsTime = b.time;
 
-                // 更新两张图（time 一样就会对齐）
                 if (typeof b.price_close === "number") {
                     priceSeries.update({ time: b.time, value: b.price_close });
                 }
@@ -318,35 +295,35 @@
             };
         }
 
-        function scheduleReconnect(market, tf) {
+        function scheduleReconnect(symbol, market, tf) {
             if (wsRetryTimer) return;
 
             wsRetryAttempt += 1;
 
             // 指数退避：0.5s, 1s, 2s, 4s, 8s... 上限 20s
             const base = Math.min(20000, 500 * Math.pow(2, Math.min(wsRetryAttempt, 6)));
-            const jitter = Math.floor(Math.random() * 400); // 0~400ms
+            const jitter = Math.floor(Math.random() * 400);
             const delay = base + jitter;
 
             statusEl.textContent = `reconnect in ${(delay / 1000).toFixed(1)}s…`;
 
             wsRetryTimer = setTimeout(() => {
                 wsRetryTimer = null;
-
-                // 只有当前选择还没变才重连
-                if (wsWant.market === market && wsWant.tf === tf) {
-                    connectWs(market, tf);
+                if (wsWant.symbol === symbol && wsWant.market === market && wsWant.tf === tf) {
+                    connectWs(symbol, market, tf);
                 }
             }, delay);
         }
 
         async function reload() {
+            const symbol = symbolSel.value;
             const market = marketSel.value;
             const tf = tfSel.value;
-            await loadHistory(market, tf);
-            connectWs(market, tf);
+            await loadHistory(symbol, market, tf);
+            connectWs(symbol, market, tf);
         }
 
+        symbolSel.addEventListener("change", reload);
         marketSel.addEventListener("change", reload);
         tfSel.addEventListener("change", reload);
 
