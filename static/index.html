@@ -243,13 +243,21 @@
 
         function syncCrosshair(srcChart, dstChart, srcSeries, dstSeries) {
             srcChart.subscribeCrosshairMove((param) => {
+                // 没有 time/不在图里：清掉
                 if (!param || param.time === undefined) {
                     dstChart.clearCrosshairPosition();
                     return;
                 }
+
                 const price = getSeriesPrice(param, srcSeries);
-                if (price == null) dstChart.setCrosshairPosition(NaN, param.time, dstSeries);
-                else dstChart.setCrosshairPosition(price, param.time, dstSeries);
+
+                // ✅ 关键：price 为空/NaN 直接 clear，不要 setCrosshairPosition(NaN)
+                if (price == null || !Number.isFinite(price)) {
+                    dstChart.clearCrosshairPosition();
+                    return;
+                }
+
+                dstChart.setCrosshairPosition(price, param.time, dstSeries);
             });
         }
         syncCrosshair(priceChart, cvdChart, priceSeries, cvdSeries);
