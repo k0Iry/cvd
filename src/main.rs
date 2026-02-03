@@ -272,6 +272,7 @@ struct Params {
     symbol: Option<String>,
     tf: Option<String>,
     limit: Option<usize>,
+    before: Option<i64>,
 }
 
 // ==============================
@@ -405,11 +406,72 @@ async fn load_history(
     Ok((VecDeque::from(v), last_cvd))
 }
 
+async fn load_history_page(
+    db: &SqlitePool,
+    symbol: &str,
+    market: &str,
+    tf: &str,
+    limit: usize,
+    before: Option<i64>,
+) -> Result<Vec<Bar>> {
+    let limit = limit.min(4000).max(1);
+
+    let rows: Vec<BarRow> = if let Some(before_ts) = before {
+        sqlx::query_as(
+            r#"
+            SELECT time, price_close, delta_usdt, cvd_usdt, trades
+            FROM bars
+            WHERE symbol = ? AND market = ? AND tf = ?
+              AND time < ?
+            ORDER BY time DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(symbol)
+        .bind(market)
+        .bind(tf)
+        .bind(before_ts)
+        .bind(limit as i64)
+        .fetch_all(db)
+        .await?
+    } else {
+        sqlx::query_as(
+            r#"
+            SELECT time, price_close, delta_usdt, cvd_usdt, trades
+            FROM bars
+            WHERE symbol = ? AND market = ? AND tf = ?
+            ORDER BY time DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(symbol)
+        .bind(market)
+        .bind(tf)
+        .bind(limit as i64)
+        .fetch_all(db)
+        .await?
+    };
+
+    // rows DESC -> 反转成 ASC，前端 setData 方便
+    let mut v: Vec<Bar> = rows
+        .into_iter()
+        .map(|r| Bar {
+            time: r.time,
+            price_close: r.price_close,
+            delta_usdt: r.delta_usdt,
+            cvd_usdt: r.cvd_usdt,
+            trades: r.trades as u64,
+        })
+        .collect();
+    v.reverse();
+    Ok(v)
+}
+
 async fn hydrate_shard(state: &AppState, market: Market, symbol: Symbol) -> Result<()> {
     let m = market.as_str();
     let s = symbol.as_str();
-    let (h1, last1) = load_history(&state.db, m, s, "1m", 2000).await?;
-    let (h5, _last5) = load_history(&state.db, m, s, "5m", 2000).await?;
+    let (h1, last1) = load_history(&state.db, m, s, "1m", 4000).await?;
+    let (h5, _last5) = load_history(&state.db, m, s, "5m", 4000).await?;
 
     let sh = pick_shard(state, market, symbol);
     *sh.hist_1m.write().await = h1;
@@ -491,39 +553,20 @@ async fn main() -> Result<()> {
 // ==============================
 
 async fn history(State(state): State<AppState>, Query(p): Query<Params>) -> impl IntoResponse {
-    let market = Market::from_str(p.market.as_deref().unwrap_or("spot"));
-    let symbol = Symbol::from_str(p.symbol.as_deref().unwrap_or("BTC"));
-    let sh = pick_shard(&state, market, symbol);
+    let symbol = p.symbol.as_deref().unwrap_or("BTC");
+    let market = p.market.as_deref().unwrap_or("spot");
+    let tf = p.tf.as_deref().unwrap_or("1m");
+    let limit = p.limit.unwrap_or(800).min(4000);
+    let before = p.before;
 
-    let tf = Tf::from_str(p.tf.as_deref().unwrap_or("1m"));
-    let limit = p.limit.unwrap_or(500).min(2000);
-
-    let bars: Vec<Bar> = match tf {
-        Tf::M1 => {
-            let h = sh.hist_1m.read().await;
-            h.iter()
-                .rev()
-                .take(limit)
-                .cloned()
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect()
-        }
-        Tf::M5 => {
-            let h = sh.hist_5m.read().await;
-            h.iter()
-                .rev()
-                .take(limit)
-                .cloned()
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect()
-        }
-    };
-
-    Json(bars)
+    match load_history_page(&state.db, symbol, market, tf, limit, before).await {
+        Ok(bars) => Json(bars).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("history error: {e}"),
+        )
+            .into_response(),
+    }
 }
 
 async fn ws_upgrade(
@@ -865,7 +908,7 @@ async fn push_publish(state: &AppState, market: Market, symbol: Symbol, tf: Tf, 
 
     // 2) in-memory history + ws broadcast for CLOSE bars
     let sh = pick_shard(state, market, symbol);
-    let max = 2000usize;
+    let max = 4000usize;
 
     match tf {
         Tf::M1 => {

@@ -109,10 +109,10 @@
         venueSel.addEventListener("change", () => {
             const v = venueSel.value;
             if (v === "coinbase") {
-                // 保留 query（可选），最简单直接跳
                 window.location.href = "/coinbase/";
             }
         });
+
         const symbolSel = document.getElementById("symbol");
         const marketSel = document.getElementById("market");
         const tfSel = document.getElementById("tf");
@@ -121,7 +121,7 @@
         const cvdEl = document.getElementById("cvd");
 
         const BASE = location.pathname.split('/')[1]; // "coinbase" or "binance"
-        const API = `/${BASE}`;
+        const API = ''// `/${BASE}`; //TODO: 修改为相对路径
 
         function mkChart(el) {
             return LightweightCharts.createChart(el, {
@@ -149,7 +149,6 @@
         const tzSel = document.getElementById("tz");
         let currentTz = tzSel.value;
 
-        // unix seconds -> formatted string
         function formatTime(sec, tz) {
             const d = new Date(sec * 1000);
             return new Intl.DateTimeFormat("en-GB", {
@@ -172,14 +171,11 @@
             });
         }
 
-        // 初始应用
         applyTimeFormatter(priceChart);
         applyTimeFormatter(cvdChart);
 
         tzSel.addEventListener("change", () => {
             currentTz = tzSel.value;
-
-            // 只刷新显示，不动 series 数据
             applyTimeFormatter(priceChart);
             applyTimeFormatter(cvdChart);
         });
@@ -229,7 +225,7 @@
         syncTimeScale(priceChart, cvdChart);
         syncTimeScale(cvdChart, priceChart);
 
-        // ✅ crosshair 同步（保留你原版）
+        // ✅ crosshair 同步
         function getSeriesPrice(param, series) {
             const sp = param && param.seriesPrices;
             if (!sp) return null;
@@ -252,54 +248,172 @@
                     return;
                 }
                 const price = getSeriesPrice(param, srcSeries);
-                if (price == null) {
-                    dstChart.setCrosshairPosition(NaN, param.time, dstSeries);
-                } else {
-                    dstChart.setCrosshairPosition(price, param.time, dstSeries);
-                }
+                if (price == null) dstChart.setCrosshairPosition(NaN, param.time, dstSeries);
+                else dstChart.setCrosshairPosition(price, param.time, dstSeries);
             });
         }
         syncCrosshair(priceChart, cvdChart, priceSeries, cvdSeries);
         syncCrosshair(cvdChart, priceChart, cvdSeries, priceSeries);
 
         // ---------------------------
-        // 数据加载与 WS（带 retry）
+        // ✅ 分页状态（新增）
         // ---------------------------
-        let ws = null;
+        const page = {
+            loadingMore: false,
+            reachedStart: false,
+            oldestTime: null,   // 当前数据最早 time(sec)
+            lastKey: "",        // symbol|market|tf，切换时重置
+            maxKeep: 4000,      // 前端最多保留多少根（防止 setData 太大卡）
+            pageSize: 800,
+        };
 
-        // retry state
-        let wsRetryTimer = null;
-        let wsRetryAttempt = 0;
+        function makeKey(symbol, market, tf) {
+            return `${symbol}|${market}|${tf}`;
+        }
 
-        // 当前想要的连接目标（避免旧连接回调污染）
-        let wsWant = { symbol: null, market: null, tf: null };
+        function mergePrepend(currentBars, olderBars) {
+            // 两边都是 ASC
+            if (!olderBars || olderBars.length === 0) return currentBars;
 
-        // 防乱序：记录最后一次更新时间
-        let lastWsTime = 0;
+            // 去重：避免边界重复 time
+            const curFirst = currentBars.length ? currentBars[0].time : null;
+            const filteredOlder = (curFirst == null)
+                ? olderBars
+                : olderBars.filter(b => b.time < curFirst);
 
-        async function loadHistory(symbol, market, tf) {
-            statusEl.textContent = "loading…";
-            const res = await fetch(`${API}/history?symbol=${encodeURIComponent(symbol)}&market=${encodeURIComponent(market)}&tf=${encodeURIComponent(tf)}&limit=800`);
-            const bars = await res.json();
+            const merged = [...filteredOlder, ...currentBars];
+
+            // 控制最大长度：保留 “最早+最近” 会导致越翻越大卡顿
+            // 这里策略：保留最近 maxKeep 根（你也可以改成保留最早 maxKeep）
+            if (merged.length > page.maxKeep) {
+                return merged.slice(merged.length - page.maxKeep);
+            }
+            return merged;
+        }
+
+        function seriesToBars() {
+            // lightweight-charts 没有直接 getData API，我们自己维护 bars 更稳
+            return page._bars || [];
+        }
+
+        function setBars(bars) {
+            page._bars = bars;
 
             priceSeries.setData(bars.map(b => ({ time: b.time, value: b.price_close })));
             cvdSeries.setData(bars.map(b => ({ time: b.time, value: b.cvd_usdt })));
+
+            page.oldestTime = bars.length ? bars[0].time : null;
+        }
+
+        // ---------------------------
+        // 数据加载与 WS（带 retry）
+        // ---------------------------
+        let ws = null;
+        let wsRetryTimer = null;
+        let wsRetryAttempt = 0;
+        let wsWant = { symbol: null, market: null, tf: null };
+        let lastWsTime = 0;
+
+        async function fetchHistory(symbol, market, tf, limit, before) {
+            const u = new URL(`${API}/history`, location.origin);
+            u.searchParams.set("symbol", symbol);
+            u.searchParams.set("market", market);
+            u.searchParams.set("tf", tf);
+            u.searchParams.set("limit", String(limit));
+            if (before != null) u.searchParams.set("before", String(before));
+            const res = await fetch(u.toString());
+            if (!res.ok) throw new Error(`history http ${res.status}`);
+            return await res.json(); // bars (ASC)
+        }
+
+        async function loadHistory(symbol, market, tf) {
+            statusEl.textContent = "loading…";
+            page.reachedStart = false;
+            page.loadingMore = false;
+
+            const bars = await fetchHistory(symbol, market, tf, page.pageSize, null);
+
+            // ✅ 首次 setData
+            setBars(bars);
 
             priceChart.timeScale().scrollToRealTime();
             statusEl.textContent = "live";
         }
 
+        async function loadMoreBefore(symbol, market, tf) {
+            if (page.loadingMore || page.reachedStart) return;
+            const barsNow = seriesToBars();
+            if (!barsNow.length) return;
+            if (page.oldestTime == null) return;
+
+            page.loadingMore = true;
+
+            // 记住当前视窗，加载后恢复，避免 setData 导致跳动
+            const range = priceChart.timeScale().getVisibleLogicalRange();
+
+            try {
+                const older = await fetchHistory(symbol, market, tf, page.pageSize, page.oldestTime);
+                if (!older.length) {
+                    page.reachedStart = true;
+                    return;
+                }
+
+                const merged = mergePrepend(barsNow, older);
+                setBars(merged);
+
+                // 恢复视窗（视觉上像“无缝补数据”）
+                if (range) {
+                    // 由于我们 prepend 了，logical range 需要整体右移 older.length
+                    // 但我们 merge 里可能裁剪了，所以用 delta = 新旧长度差来估计更稳
+                    const delta = merged.length - barsNow.length;
+                    priceChart.timeScale().setVisibleLogicalRange({
+                        from: range.from + delta,
+                        to: range.to + delta,
+                    });
+                }
+            } catch (e) {
+                // 翻页失败不要锁死
+                console.warn("loadMoreBefore failed:", e);
+            } finally {
+                page.loadingMore = false;
+            }
+        }
+
+        // 当用户把视窗拖到最左侧附近，就触发翻页
+        function maybeLoadMore(symbol, market, tf) {
+            const barsNow = seriesToBars();
+            if (!barsNow.length) return;
+
+            const logical = priceChart.timeScale().getVisibleLogicalRange();
+            if (!logical) return;
+
+            // 视窗左边界距离 0（数据起点）还剩多少根
+            // 0 是第一根 bar 的 logical index
+            const left = logical.from;
+
+            // 阈值：<= 30 根就补一页
+            if (left <= 30) {
+                loadMoreBefore(symbol, market, tf);
+            }
+        }
+
+        // 订阅：拖动/缩放都会触发
+        priceChart.timeScale().subscribeVisibleLogicalRangeChange(() => {
+            const symbol = symbolSel.value;
+            const market = marketSel.value;
+            const tf = tfSel.value;
+            maybeLoadMore(symbol, market, tf);
+        });
+
         function connectWs(symbol, market, tf) {
             wsWant = { symbol, market, tf };
             lastWsTime = 0;
 
-            // 取消待重连
             if (wsRetryTimer) {
                 clearTimeout(wsRetryTimer);
                 wsRetryTimer = null;
             }
 
-            // 关闭旧连接（并断开旧回调）
             if (ws) {
                 try { ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null; } catch { }
                 try { ws.close(); } catch { }
@@ -326,7 +440,7 @@
                 wsRetryAttempt = 0;
                 statusEl.textContent = "live";
 
-                // ✅ 重连成功后补一次 history（补齐断线期间 bar）
+                // 重连补一次 history（保留你的逻辑）
                 try { await loadHistory(symbol, market, tf); } catch { }
             };
 
@@ -337,7 +451,6 @@
             };
 
             ws.onerror = () => {
-                // 避免 onerror + onclose 双 schedule（让 onclose 来做）
                 if (wsWant.symbol !== symbol || wsWant.market !== market || wsWant.tf !== tf) return;
                 statusEl.textContent = "error";
             };
@@ -352,11 +465,24 @@
                 if (b.time < lastWsTime) return;
                 lastWsTime = b.time;
 
-                if (typeof b.price_close === "number") {
-                    priceSeries.update({ time: b.time, value: b.price_close });
-                }
-                if (typeof b.cvd_usdt === "number") {
-                    cvdSeries.update({ time: b.time, value: b.cvd_usdt });
+                // ✅ 更新内存 bars（用于翻页判断 & 合并）
+                const barsNow = seriesToBars();
+                if (barsNow.length) {
+                    const last = barsNow[barsNow.length - 1];
+                    if (last && last.time === b.time) {
+                        // 同一根 bar 更新
+                        barsNow[barsNow.length - 1] = { ...barsNow[barsNow.length - 1], ...b };
+                    } else if (last && b.time > last.time) {
+                        barsNow.push(b);
+                        // 控制长度（保持最近 maxKeep）
+                        if (barsNow.length > page.maxKeep) barsNow.shift();
+                    } else {
+                        // 乱序/历史 update：忽略
+                    }
+                    setBars(barsNow);
+                } else {
+                    // 没数据时兜底
+                    setBars([b]);
                 }
             };
         }
@@ -365,8 +491,6 @@
             if (wsRetryTimer) return;
 
             wsRetryAttempt += 1;
-
-            // 指数退避：0.5s, 1s, 2s, 4s, 8s... 上限 20s
             const base = Math.min(20000, 500 * Math.pow(2, Math.min(wsRetryAttempt, 6)));
             const jitter = Math.floor(Math.random() * 400);
             const delay = base + jitter;
@@ -385,6 +509,17 @@
             const symbol = symbolSel.value;
             const market = marketSel.value;
             const tf = tfSel.value;
+
+            // ✅ 切换 key 时重置分页状态
+            const key = makeKey(symbol, market, tf);
+            if (page.lastKey !== key) {
+                page.lastKey = key;
+                page.reachedStart = false;
+                page.loadingMore = false;
+                page.oldestTime = null;
+                page._bars = [];
+            }
+
             await loadHistory(symbol, market, tf);
             connectWs(symbol, market, tf);
         }
