@@ -121,7 +121,7 @@
         const cvdEl = document.getElementById("cvd");
 
         const BASE = location.pathname.split('/')[1]; // "coinbase" or "binance"
-        const API = ''// `/${BASE}`; //TODO: 修改为相对路径
+        const API = `/${BASE}`;
 
         function mkChart(el) {
             return LightweightCharts.createChart(el, {
