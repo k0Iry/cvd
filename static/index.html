@@ -94,6 +94,8 @@
             <option value="Europe/London">London</option>
         </select>
 
+        <button id="shotAll">📸 Screenshot</button>
+
         <div id="status" class="pill">loading…</div>
     </div>
 
@@ -357,6 +359,34 @@
         tfSel.onchange = reload;
 
         reload();
+
+        /* ---------- screenshot (方案 B：合成一张) ---------- */
+        function screenshotBoth() {
+            const c1 = priceChart.takeScreenshot();
+            const c2 = cvdChart.takeScreenshot();
+
+            const w = Math.max(c1.width, c2.width);
+            const h = c1.height + c2.height;
+
+            const out = document.createElement("canvas");
+            out.width = w;
+            out.height = h;
+
+            const ctx = out.getContext("2d");
+            // 背景色，避免透明
+            ctx.fillStyle = "#111";
+            ctx.fillRect(0, 0, w, h);
+
+            ctx.drawImage(c1, 0, 0);
+            ctx.drawImage(c2, 0, c1.height);
+
+            const a = document.createElement("a");
+            a.download = `cvd_${symbolSel.value}_${marketSel.value}_${tfSel.value}.png`;
+            a.href = out.toDataURL("image/png");
+            a.click();
+        }
+
+        document.getElementById("shotAll").onclick = screenshotBoth;
     </script>
 </body>
 
