@@ -92,7 +92,7 @@ pub async fn run_coinbase_engine(
                         };
 
                         // side: "buy" (taker buy) => positive, "sell" (taker sell) => negative
-                        let signed_size = if m.side == "sell" { size } else { -size };
+                        let signed_size = if m.side == "sell" { -size } else { size };
                         let delta_usdt = signed_size * price;
 
                         let ts_ms = crate::parse_iso8601_to_ms(&m.time)?;
