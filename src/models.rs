@@ -5,9 +5,9 @@ pub struct AggTrade {
     #[serde(rename = "e")]
     pub event_type: String,
     #[serde(rename = "p")]
-    pub price: String,
+    pub price: f64,
     #[serde(rename = "q")]
-    pub quantity: String,
+    pub quantity: f64,
     #[serde(rename = "T")]
     pub trade_time: i64,
     #[serde(rename = "m")]
@@ -21,8 +21,8 @@ pub struct CoinbaseMatch {
     pub msg_type: String, // "match"
     pub time: String, // ISO8601
     pub product_id: String,
-    pub size: String,
-    pub price: String,
+    pub size: f64,
+    pub price: f64,
     pub side: String, // maker side: "buy" or "sell"
 }
 

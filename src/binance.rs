@@ -48,24 +48,15 @@ pub async fn run_binance_engine(
                     continue;
                 }
 
-                let price: f64 = match t.price.parse() {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let qty: f64 = match t.quantity.parse() {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-
                 // m=true => buyer is maker => aggressive SELL => negative delta
-                let delta_base = if t.is_buyer_maker { -qty } else { qty };
-                let delta_usdt = delta_base * price;
+                let delta_base = if t.is_buyer_maker { -t.quantity } else { t.quantity };
+                let delta_usdt = delta_base * t.price;
 
                 let ts_ms = t.trade_time;
                 let this_sec = ts_ms / 1000;
 
                 match sec.cur_sec {
-                    None => sec.reset_to(this_sec, price, delta_usdt),
+                    None => sec.reset_to(this_sec, t.price, delta_usdt),
                     Some(s) if s != this_sec => {
                         let sec_ended = s;
                         let sec_last_price = sec.last_price;
@@ -89,9 +80,9 @@ pub async fn run_binance_engine(
 
                         *sh.cvd_closed_usdt.write().await = cvd_closed_usdt;
 
-                        sec.reset_to(this_sec, price, delta_usdt);
+                        sec.reset_to(this_sec, t.price, delta_usdt);
                     }
-                    _ => sec.add(price, delta_usdt),
+                    _ => sec.add(t.price, delta_usdt),
                 }
             }
             Message::Close(_) => break,
