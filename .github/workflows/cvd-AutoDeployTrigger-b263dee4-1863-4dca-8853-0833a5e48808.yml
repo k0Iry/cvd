@@ -1,49 +1,33 @@
-name: Trigger auto deployment for cvd
+name: Deploy cvd to Azure Container Apps
 
-# When this action will be executed
 on:
-  # Automatically trigger it when detected changes in repo
   push:
-    branches: 
-      [ master ]
-    paths:
-    - '**'
-    - '.github/workflows/cvd-AutoDeployTrigger-b263dee4-1863-4dca-8853-0833a5e48808.yml'
-
-  # Allow manual trigger 
-  workflow_dispatch:      
+    branches: [ "master" ]
+  workflow_dispatch:
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    permissions: 
-      id-token: write #This is required for requesting the OIDC JWT Token
-      contents: read #Required when GH token is used to authenticate with private repo
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
-      - name: Checkout to the branch
-        uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-      - name: Azure Login
-        uses: azure/login@v2
+      - uses: azure/login@v2
         with:
           client-id: ${{ secrets.CVD_AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.CVD_AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.CVD_AZURE_SUBSCRIPTION_ID }}
 
-      - name: Build and push container image to registry
-        uses: azure/container-apps-deploy-action@v2
+      - uses: azure/container-apps-deploy-action@v2
         with:
           appSourcePath: ${{ github.workspace }}
-          _dockerfilePathKey_: _dockerfilePath_
-          _targetLabelKey_: _targetLabel_
-          registryUrl: 
+          dockerfilePath: ./Dockerfile
+          registryUrl: ${{ secrets.CVD_REGISTRY_SERVER }}
           registryUsername: ${{ secrets.CVD_REGISTRY_USERNAME }}
           registryPassword: ${{ secrets.CVD_REGISTRY_PASSWORD }}
           containerAppName: cvd
           resourceGroup: cvd
-          imageToBuild: default/[parameters('containerAppName')]:${{ github.sha }}
-          _buildArgumentsKey_: |
-            _buildArgumentsValues_
-
-
+          imageToBuild: ${{ secrets.CVD_REGISTRY_SERVER }}/cvd:${{ github.sha }}
