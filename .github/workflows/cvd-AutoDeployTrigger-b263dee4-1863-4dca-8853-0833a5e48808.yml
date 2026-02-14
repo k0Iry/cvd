@@ -11,6 +11,12 @@ jobs:
     permissions:
       id-token: write
       contents: read
+    env:
+      ACR_NAME: cvdacr2026
+      ACR_SERVER: cvdacr2026.azurecr.io
+      RG: cvd
+      APP: cvd
+      IMAGE_REPO: cvd
 
     steps:
       - uses: actions/checkout@v4
@@ -23,24 +29,31 @@ jobs:
 
       - name: Login to ACR (AAD)
         run: |
-          ACR_NAME="cvdacr2026"
-          ACR_SERVER="${ACR_NAME}.azurecr.io"
-
           TOKEN=$(az acr login --name "$ACR_NAME" --expose-token --output tsv --query accessToken)
           echo "$TOKEN" | docker login "$ACR_SERVER" -u 00000000-0000-0000-0000-000000000000 --password-stdin
 
-          echo "ACR_SERVER=$ACR_SERVER" >> $GITHUB_ENV
-
       - name: Build & push image
         run: |
-          IMAGE="$ACR_SERVER/cvd:${{ github.sha }}"
+          IMAGE="$ACR_SERVER/$IMAGE_REPO:${{ github.sha }}"
           docker build -t "$IMAGE" -f ./Dockerfile .
           docker push "$IMAGE"
           echo "IMAGE=$IMAGE" >> $GITHUB_ENV
 
-      - name: Update Container App
+      - name: Configure Container App registry auth
+        run: |
+          ACR_USER=$(az acr credential show -n "$ACR_NAME" -g "$RG" --query "username" -o tsv)
+          ACR_PASS=$(az acr credential show -n "$ACR_NAME" -g "$RG" --query "passwords[0].value" -o tsv)
+
+          az containerapp registry set \
+            --name "$APP" \
+            --resource-group "$RG" \
+            --server "$ACR_SERVER" \
+            --username "$ACR_USER" \
+            --password "$ACR_PASS"
+
+      - name: Update Container App image
         run: |
           az containerapp update \
-            --name cvd \
-            --resource-group cvd \
+            --name "$APP" \
+            --resource-group "$RG" \
             --image "$IMAGE"
