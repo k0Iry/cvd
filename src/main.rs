@@ -1,4 +1,10 @@
-use anyhow::{anyhow, Result};
+mod types;
+mod models;
+mod aggregator;
+mod binance;
+mod coinbase;
+
+use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket};
 use axum::{
     extract::{Query, State, WebSocketUpgrade},
@@ -7,13 +13,12 @@ use axum::{
     Router,
 };
 use chrono::{DateTime, Utc};
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use rand::Rng;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
-use std::hash::Hash;
 use std::str::FromStr;
 use std::{collections::VecDeque, net::SocketAddr, sync::Arc};
 use tokio::sync::{broadcast, RwLock};
@@ -21,281 +26,20 @@ use tokio::time::{sleep, Duration};
 use tokio_tungstenite::connect_async;
 use tower_http::services::ServeDir;
 
-// ==============================
-// Types: Exchange / Market / Symbol / Tf
-// ==============================
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-enum Exchange {
-    Binance,
-    Coinbase,
-}
-impl Exchange {
-    fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "coinbase" => Self::Coinbase,
-            _ => Self::Binance,
-        }
-    }
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Binance => "binance",
-            Self::Coinbase => "coinbase",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-enum Market {
-    Spot,
-    Usdm,
-    Coinm,
-}
-impl Market {
-    fn from_str(s: &str) -> Self {
-        match s {
-            "usdm" => Self::Usdm,
-            "coinm" => Self::Coinm,
-            _ => Self::Spot,
-        }
-    }
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Spot => "spot",
-            Self::Usdm => "usdm",
-            Self::Coinm => "coinm",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-enum Symbol {
-    BTC,
-    ETH,
-    SOL,
-    BNB,
-    AAVE,
-}
-impl Symbol {
-    fn from_str(s: &str) -> Self {
-        match s.to_uppercase().as_str() {
-            "ETH" => Self::ETH,
-            "SOL" => Self::SOL,
-            "BNB" => Self::BNB,
-            "AAVE" => Self::AAVE,
-            _ => Self::BTC,
-        }
-    }
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::BTC => "BTC",
-            Self::ETH => "ETH",
-            Self::SOL => "SOL",
-            Self::BNB => "BNB",
-            Self::AAVE => "AAVE",
-        }
-    }
-
-    // Spot / USDM use <asset>USDT
-    fn spot_usdm_stream(self) -> &'static str {
-        match self {
-            Self::BTC => "btcusdt",
-            Self::ETH => "ethusdt",
-            Self::SOL => "solusdt",
-            Self::BNB => "bnbusdt",
-            Self::AAVE => "aaveusdt",
-        }
-    }
-
-    // COINM uses <asset>USD_PERP
-    fn coinm_stream(self) -> &'static str {
-        match self {
-            Self::BTC => "btcusd_perp",
-            Self::ETH => "ethusd_perp",
-            Self::SOL => "solusd_perp",
-            Self::BNB => "bnbusd_perp",
-            Self::AAVE => "aaveusd_perp",
-        }
-    }
-
-    // Coinbase product_id for trading pairs
-    fn coinbase_product_id(self) -> &'static str {
-        match self {
-            Self::BTC => "BTC-USD",
-            Self::ETH => "ETH-USD",
-            _ => "BTC-USD", // Only BTC and ETH for Coinbase
-        }
-    }
-}
-
-// Coinbase "match" message schema
-#[derive(Debug, Deserialize)]
-struct CoinbaseMatch {
-    #[serde(rename = "type")]
-    msg_type: String, // "match"
-    time: String, // ISO8601
-    product_id: String,
-    size: String,
-    price: String,
-    side: String, // maker side: "buy" or "sell"
-}
-
-// Coinbase subscribe request
-#[derive(Debug, Serialize)]
-struct CoinbaseSubscribe<'a> {
-    #[serde(rename = "type")]
-    msg_type: &'a str, // "subscribe"
-    product_ids: Vec<&'a str>,
-    channels: Vec<&'a str>, // ["matches"]
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-enum Tf {
-    M1,
-    M5,
-}
-impl Tf {
-    fn ms(self) -> i64 {
-        match self {
-            Tf::M1 => 60_000,
-            Tf::M5 => 300_000,
-        }
-    }
-    fn from_str(s: &str) -> Self {
-        match s {
-            "5m" => Tf::M5,
-            _ => Tf::M1,
-        }
-    }
-    fn as_str(self) -> &'static str {
-        match self {
-            Tf::M1 => "1m",
-            Tf::M5 => "5m",
-        }
-    }
-}
-
-// ws URL builders
-fn get_ws_url(exchange: Exchange, market: Market, symbol: Symbol) -> String {
-    match exchange {
-        Exchange::Binance => binance_ws_url(market, symbol),
-        Exchange::Coinbase => "wss://ws-feed.exchange.coinbase.com".to_string(),
-    }
-}
-
-fn binance_ws_url(market: Market, symbol: Symbol) -> String {
-    let sym = match market {
-        Market::Coinm => symbol.coinm_stream(),
-        _ => symbol.spot_usdm_stream(),
-    };
-
-    match market {
-        Market::Spot => format!("wss://stream.binance.com:9443/ws/{sym}@aggTrade"),
-        Market::Usdm => format!("wss://fstream.binance.com/ws/{sym}@aggTrade"),
-        Market::Coinm => format!("wss://dstream.binance.com/ws/{sym}@aggTrade"),
-    }
-}
+use types::{Exchange, Market, Symbol, Tf};
+use models::Bar;
 
 // ==============================
-// Models
-// ==============================
-
-#[derive(Debug, Deserialize)]
-struct AggTrade {
-    #[serde(rename = "e")]
-    event_type: String,
-    #[serde(rename = "p")]
-    price: String,
-    #[serde(rename = "q")]
-    quantity: String,
-    #[serde(rename = "T")]
-    trade_time: i64,
-    #[serde(rename = "m")]
-    is_buyer_maker: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct Bar {
-    time: i64, // unix seconds (lightweight-charts)
-    price_close: f64,
-    delta_usdt: f64,
-    cvd_usdt: f64,
-    trades: u64,
-}
-
-#[derive(sqlx::FromRow)]
-struct BarRow {
-    time: i64,
-    price_close: f64,
-    delta_usdt: f64,
-    cvd_usdt: f64,
-    trades: i64,
-}
-
-// ==============================
-// Aggregators
-// ==============================
-
-#[derive(Debug, Clone)]
-struct BucketAgg {
-    cur_bucket_id: Option<i64>,
-    last_price: f64,
-    delta_usdt: f64,
-    trades: u64,
-}
-impl BucketAgg {
-    fn new() -> Self {
-        Self {
-            cur_bucket_id: None,
-            last_price: f64::NAN,
-            delta_usdt: 0.0,
-            trades: 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct SecAgg {
-    cur_sec: Option<i64>,
-    last_price: f64,
-    delta_usdt: f64,
-    trades: u64,
-}
-impl SecAgg {
-    fn new() -> Self {
-        Self {
-            cur_sec: None,
-            last_price: f64::NAN,
-            delta_usdt: 0.0,
-            trades: 0,
-        }
-    }
-
-    fn reset_to(&mut self, sec: i64, price: f64, delta_usdt: f64) {
-        self.cur_sec = Some(sec);
-        self.last_price = price;
-        self.delta_usdt = delta_usdt;
-        self.trades = 1;
-    }
-
-    fn add(&mut self, price: f64, delta_usdt: f64) {
-        self.last_price = price;
-        self.delta_usdt += delta_usdt;
-        self.trades += 1;
-    }
-}
-
-// ==============================
-// State (per market+symbol shard)
+// State / Shard
 // ==============================
 
 #[derive(Clone)]
-struct Shard {
-    hist_1m: Arc<RwLock<VecDeque<Bar>>>,
-    hist_5m: Arc<RwLock<VecDeque<Bar>>>,
-    tx_1m: broadcast::Sender<Bar>,
-    tx_5m: broadcast::Sender<Bar>,
-    cvd_closed_usdt: Arc<RwLock<f64>>,
+pub struct Shard {
+    pub hist_1m: Arc<RwLock<VecDeque<Bar>>>,
+    pub hist_5m: Arc<RwLock<VecDeque<Bar>>>,
+    pub tx_1m: broadcast::Sender<Bar>,
+    pub tx_5m: broadcast::Sender<Bar>,
+    pub cvd_closed_usdt: Arc<RwLock<f64>>,
 }
 
 fn mk_shard() -> Shard {
@@ -310,10 +54,9 @@ fn mk_shard() -> Shard {
     }
 }
 
-#[derive(Clone)]
-struct AppState {
-    shards: Arc<HashMap<(Exchange, Market, Symbol), Shard>>,
-    db: SqlitePool,
+pub struct AppState {
+    pub shards: Arc<HashMap<(Exchange, Market, Symbol), Shard>>,
+    pub db: SqlitePool,
 }
 
 fn pick_shard(state: &AppState, exchange: Exchange, market: Market, symbol: Symbol) -> &Shard {
@@ -352,16 +95,15 @@ async fn init_db(db: &SqlitePool) -> Result<()> {
             .unwrap_or_default();
 
     let has_bars = !cols.is_empty();
-    let has_symbol_col = cols.iter().any(|c| c.1 == "symbol");
+    let has_exchange_col = cols.iter().any(|c| c.1 == "exchange");
 
-    if has_bars && !has_symbol_col {
-        // Old schema: (market, tf, time, ...)
-        // Migrate to new schema with symbol column.
-        eprintln!("DB migrate: old bars table detected (no symbol). Migrating to bars_v2...");
+    if has_bars && !has_exchange_col {
+        eprintln!("DB migrate: old bars table detected (no exchange). Migrating to bars_v2...");
 
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS bars_v2 (
+                exchange TEXT NOT NULL,
                 market TEXT NOT NULL,
                 symbol TEXT NOT NULL,
                 tf TEXT NOT NULL,
@@ -370,25 +112,23 @@ async fn init_db(db: &SqlitePool) -> Result<()> {
                 delta_usdt REAL NOT NULL,
                 cvd_usdt REAL NOT NULL,
                 trades INTEGER NOT NULL,
-                PRIMARY KEY (market, symbol, tf, time)
+                PRIMARY KEY (exchange, market, symbol, tf, time)
             );
             "#,
         )
         .execute(db)
         .await?;
 
-        // Copy old rows, default symbol=BTC
         sqlx::query(
             r#"
-            INSERT OR IGNORE INTO bars_v2 (market, symbol, tf, time, price_close, delta_usdt, cvd_usdt, trades)
-            SELECT market, 'BTC', tf, time, price_close, delta_usdt, cvd_usdt, trades
+            INSERT OR IGNORE INTO bars_v2 (exchange, market, symbol, tf, time, price_close, delta_usdt, cvd_usdt, trades)
+            SELECT 'binance', market, symbol, tf, time, price_close, delta_usdt, cvd_usdt, trades
             FROM bars;
             "#,
         )
         .execute(db)
         .await?;
 
-        // Replace old table
         sqlx::query("DROP TABLE bars;").execute(db).await?;
         sqlx::query("ALTER TABLE bars_v2 RENAME TO bars;")
             .execute(db)
@@ -435,7 +175,7 @@ async fn load_history(
     tf: &str,
     limit: usize,
 ) -> Result<(VecDeque<Bar>, f64)> {
-    let rows: Vec<BarRow> = sqlx::query_as(
+    let rows: Vec<models::BarRow> = sqlx::query_as(
         r#"
         SELECT time, price_close, delta_usdt, cvd_usdt, trades
         FROM bars
@@ -479,7 +219,7 @@ async fn load_history_page(
 ) -> Result<Vec<Bar>> {
     let limit = limit.min(4000).max(1);
 
-    let rows: Vec<BarRow> = if let Some(before_ts) = before {
+    let rows: Vec<models::BarRow> = if let Some(before_ts) = before {
         sqlx::query_as(
             r#"
             SELECT time, price_close, delta_usdt, cvd_usdt, trades
@@ -517,7 +257,6 @@ async fn load_history_page(
         .await?
     };
 
-    // rows DESC -> 反转成 ASC，前端 setData 方便
     let mut v: Vec<Bar> = rows
         .into_iter()
         .map(|r| Bar {
@@ -553,7 +292,6 @@ async fn hydrate_shard(state: &AppState, exchange: Exchange, market: Market, sym
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // DB URL from env (default relative file)
     let sqlite_url = std::env::var("SQLITE_URL").unwrap_or_else(|_| "sqlite:cvd.db".to_string());
     let opts = SqliteConnectOptions::from_str(&sqlite_url)?.create_if_missing(true);
 
@@ -578,11 +316,9 @@ async fn main() -> Result<()> {
 
     for &ex in &exchanges {
         for &m in &markets {
-            // Coinbase only has Spot market
             if ex == Exchange::Coinbase && m != Market::Spot {
                 continue;
             }
-            // Coinbase only supports BTC and ETH
             let syms = if ex == Exchange::Coinbase {
                 &[Symbol::BTC, Symbol::ETH]
             } else {
@@ -598,6 +334,7 @@ async fn main() -> Result<()> {
         shards: Arc::new(shards),
         db,
     };
+    let state = Arc::new(state);
 
     // hydrate histories for each shard
     for &ex in &exchanges {
@@ -628,7 +365,8 @@ async fn main() -> Result<()> {
                 &symbols[..]
             };
             for &s in syms {
-                tokio::spawn(engine_loop(state.clone(), ex, m, s));
+                let state_clone = state.clone();
+                tokio::spawn(engine_loop(state_clone, ex, m, s));
             }
         }
     }
@@ -651,7 +389,7 @@ async fn main() -> Result<()> {
 // HTTP handlers
 // ==============================
 
-async fn history(State(state): State<AppState>, Query(p): Query<Params>) -> impl IntoResponse {
+async fn history(State(state): State<Arc<AppState>>, Query(p): Query<Params>) -> impl IntoResponse {
     let exchange = p.exchange.as_deref().unwrap_or("binance");
     let symbol = p.symbol.as_deref().unwrap_or("BTC");
     let market = p.market.as_deref().unwrap_or("spot");
@@ -671,7 +409,7 @@ async fn history(State(state): State<AppState>, Query(p): Query<Params>) -> impl
 
 async fn ws_upgrade(
     ws: WebSocketUpgrade,
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     Query(p): Query<Params>,
 ) -> impl IntoResponse {
     let exchange = Exchange::from_str(p.exchange.as_deref().unwrap_or("binance"));
@@ -683,7 +421,7 @@ async fn ws_upgrade(
 
 async fn ws_handler(
     mut socket: WebSocket,
-    state: AppState,
+    state: Arc<AppState>,
     exchange: Exchange,
     market: Market,
     symbol: Symbol,
@@ -726,7 +464,7 @@ async fn ws_handler(
 // Engine
 // ==============================
 
-async fn engine_loop(state: AppState, exchange: Exchange, market: Market, symbol: Symbol) {
+async fn engine_loop(state: Arc<AppState>, exchange: Exchange, market: Market, symbol: Symbol) {
     let mut attempt: u32 = 0;
 
     loop {
@@ -763,6 +501,26 @@ async fn engine_loop(state: AppState, exchange: Exchange, market: Market, symbol
     }
 }
 
+pub fn binance_ws_url(market: Market, symbol: Symbol) -> String {
+    let sym = match market {
+        Market::Coinm => symbol.coinm_stream(),
+        _ => symbol.spot_usdm_stream(),
+    };
+
+    match market {
+        Market::Spot => format!("wss://stream.binance.com:9443/ws/{sym}@aggTrade"),
+        Market::Usdm => format!("wss://fstream.binance.com/ws/{sym}@aggTrade"),
+        Market::Coinm => format!("wss://dstream.binance.com/ws/{sym}@aggTrade"),
+    }
+}
+
+pub fn get_ws_url(exchange: Exchange, market: Market, symbol: Symbol) -> String {
+    match exchange {
+        Exchange::Binance => binance_ws_url(market, symbol),
+        Exchange::Coinbase => "wss://ws-feed.exchange.coinbase.com".to_string(),
+    }
+}
+
 async fn run_engine_once(state: &AppState, exchange: Exchange, market: Market, symbol: Symbol) -> Result<()> {
     let url = get_ws_url(exchange, market, symbol);
     eprintln!(
@@ -774,291 +532,23 @@ async fn run_engine_once(state: &AppState, exchange: Exchange, market: Market, s
     );
 
     let (ws_stream, _resp) = connect_async(&url).await?;
-    let (mut write, mut read) = ws_stream.split();
+    let (write, read) = ws_stream.split();
 
     let sh = pick_shard(state, exchange, market, symbol);
 
     match exchange {
-        Exchange::Binance => run_binance_engine(state, exchange, market, symbol, &sh, write, read).await,
-        Exchange::Coinbase => run_coinbase_engine(state, exchange, market, symbol, &sh, write, read).await,
+        Exchange::Binance => binance::run_binance_engine(state, exchange, market, symbol, sh, write, read).await,
+        Exchange::Coinbase => coinbase::run_coinbase_engine(state, exchange, market, symbol, sh, write, read).await,
     }
 }
 
-// Helper to parse ISO8601 timestamps to milliseconds
-fn parse_iso8601_to_ms(s: &str) -> Result<i64> {
-    let dt: DateTime<Utc> = s.parse()?;
-    Ok(dt.timestamp_millis())
-}
-
-async fn run_binance_engine(
+pub async fn flush_second(
     state: &AppState,
     exchange: Exchange,
     market: Market,
     symbol: Symbol,
-    sh: &Shard,
-    mut write: futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, tokio_tungstenite::tungstenite::Message>,
-    mut read: futures::stream::SplitStream<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>,
-) -> Result<()> {
-    let mut cvd_closed_usdt = *sh.cvd_closed_usdt.read().await;
-
-    let mut sec = SecAgg::new();
-    let mut a1 = BucketAgg::new();
-    let mut a5 = BucketAgg::new();
-
-    while let Some(msg) = read.next().await {
-        let msg = match msg {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("[{}:{}:{}] read err: {e}", exchange.as_str(), market.as_str(), symbol.as_str());
-                break;
-            }
-        };
-
-        match msg {
-            tokio_tungstenite::tungstenite::Message::Ping(payload) => {
-                write
-                    .send(tokio_tungstenite::tungstenite::Message::Pong(payload))
-                    .await?;
-            }
-            tokio_tungstenite::tungstenite::Message::Text(txt) => {
-                let t: AggTrade = match serde_json::from_str(&txt) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                if t.event_type != "aggTrade" {
-                    continue;
-                }
-
-                let price: f64 = match t.price.parse() {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let qty: f64 = match t.quantity.parse() {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-
-                // m=true => buyer is maker => aggressive SELL => negative delta
-                let delta_base = if t.is_buyer_maker { -qty } else { qty };
-                let delta_usdt = delta_base * price;
-
-                let ts_ms = t.trade_time;
-                let this_sec = ts_ms / 1000;
-
-                match sec.cur_sec {
-                    None => sec.reset_to(this_sec, price, delta_usdt),
-                    Some(s) if s != this_sec => {
-                        let sec_ended = s;
-                        let sec_last_price = sec.last_price;
-                        let sec_delta = sec.delta_usdt;
-                        let sec_trades = sec.trades;
-
-                        flush_second(
-                            state,
-                            exchange,
-                            market,
-                            symbol,
-                            &mut a1,
-                            &mut a5,
-                            &mut cvd_closed_usdt,
-                            sec_ended,
-                            sec_last_price,
-                            sec_delta,
-                            sec_trades,
-                        )
-                        .await;
-
-                        *sh.cvd_closed_usdt.write().await = cvd_closed_usdt;
-
-                        sec.reset_to(this_sec, price, delta_usdt);
-                    }
-                    _ => sec.add(price, delta_usdt),
-                }
-            }
-            tokio_tungstenite::tungstenite::Message::Close(_) => break,
-            _ => {}
-        }
-    }
-
-    // flush last partial second (best-effort)
-    if let Some(s) = sec.cur_sec {
-        flush_second(
-            state,
-            exchange,
-            market,
-            symbol,
-            &mut a1,
-            &mut a5,
-            &mut cvd_closed_usdt,
-            s,
-            sec.last_price,
-            sec.delta_usdt,
-            sec.trades,
-        )
-        .await;
-
-        *sh.cvd_closed_usdt.write().await = cvd_closed_usdt;
-    }
-
-    Err(anyhow!("ws ended"))
-}
-
-async fn run_coinbase_engine(
-    state: &AppState,
-    exchange: Exchange,
-    market: Market,
-    symbol: Symbol,
-    sh: &Shard,
-    mut write: futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, tokio_tungstenite::tungstenite::Message>,
-    mut read: futures::stream::SplitStream<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>,
-) -> Result<()> {
-    // Subscribe to matches for BTC-USD + ETH-USD
-    let product_ids = match symbol {
-        Symbol::BTC => vec!["BTC-USD"],
-        Symbol::ETH => vec!["ETH-USD"],
-        _ => return Err(anyhow!("Coinbase only supports BTC and ETH")),
-    };
-
-    let sub = CoinbaseSubscribe {
-        msg_type: "subscribe",
-        product_ids,
-        channels: vec!["matches"],
-    };
-    write
-        .send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::to_string(&sub)?,
-        ))
-        .await?;
-
-    let mut cvd_closed_usdt = *sh.cvd_closed_usdt.read().await;
-    let mut sec = SecAgg::new();
-    let mut a1 = BucketAgg::new();
-    let mut a5 = BucketAgg::new();
-
-    let mut ping = tokio::time::interval(Duration::from_secs(20));
-    loop {
-        tokio::select! {
-            _ = ping.tick() => {
-                // Keep-alive ping
-                let _ = write.send(
-                    tokio_tungstenite::tungstenite::Message::Ping(vec![])
-                ).await;
-            }
-
-            msg = read.next() => {
-                let msg = match msg {
-                    Some(Ok(m)) => m,
-                    Some(Err(e)) => return Err(e.into()),
-                    None => break,
-                };
-
-                match msg {
-                    tokio_tungstenite::tungstenite::Message::Ping(payload) => {
-                        write
-                            .send(tokio_tungstenite::tungstenite::Message::Pong(payload))
-                            .await?;
-                    }
-                    tokio_tungstenite::tungstenite::Message::Text(txt) => {
-                        let m: CoinbaseMatch = match serde_json::from_str(&txt) {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-                        if m.msg_type != "match" {
-                            continue;
-                        }
-
-                        let expected_product = match symbol {
-                            Symbol::BTC => "BTC-USD",
-                            Symbol::ETH => "ETH-USD",
-                            _ => unreachable!(),
-                        };
-                        if m.product_id != expected_product {
-                            continue;
-                        }
-
-                        let price: f64 = match m.price.parse() {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-                        let size: f64 = match m.size.parse() {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-
-                        // side: "buy" (taker buy) => positive, "sell" (taker sell) => negative
-                        let signed_size = if m.side == "sell" { size } else { -size };
-                        let delta_usdt = signed_size * price;
-
-                        let ts_ms = parse_iso8601_to_ms(&m.time)?;
-                        let this_sec = ts_ms / 1000;
-
-                        match sec.cur_sec {
-                            None => sec.reset_to(this_sec, price, delta_usdt),
-                            Some(s) if s != this_sec => {
-                                let sec_ended = s;
-                                let sec_last_price = sec.last_price;
-                                let sec_delta = sec.delta_usdt;
-                                let sec_trades = sec.trades;
-
-                                flush_second(
-                                    state,
-                                    exchange,
-                                    market,
-                                    symbol,
-                                    &mut a1,
-                                    &mut a5,
-                                    &mut cvd_closed_usdt,
-                                    sec_ended,
-                                    sec_last_price,
-                                    sec_delta,
-                                    sec_trades,
-                                )
-                                .await;
-
-                                *sh.cvd_closed_usdt.write().await = cvd_closed_usdt;
-
-                                sec.reset_to(this_sec, price, delta_usdt);
-                            }
-                            _ => sec.add(price, delta_usdt),
-                        }
-                    }
-                    tokio_tungstenite::tungstenite::Message::Close(_) => break,
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    // flush last partial second (best-effort)
-    if let Some(s) = sec.cur_sec {
-        flush_second(
-            state,
-            exchange,
-            market,
-            symbol,
-            &mut a1,
-            &mut a5,
-            &mut cvd_closed_usdt,
-            s,
-            sec.last_price,
-            sec.delta_usdt,
-            sec.trades,
-        )
-        .await;
-
-        *sh.cvd_closed_usdt.write().await = cvd_closed_usdt;
-    }
-
-    Err(anyhow!("ws ended"))
-}
-
-async fn flush_second(
-    state: &AppState,
-    exchange: Exchange,
-    market: Market,
-    symbol: Symbol,
-    a1: &mut BucketAgg,
-    a5: &mut BucketAgg,
+    a1: &mut aggregator::BucketAgg,
+    a5: &mut aggregator::BucketAgg,
     cvd_closed_usdt: &mut f64,
     sec_ended: i64,
     sec_last_price: f64,
@@ -1069,7 +559,7 @@ async fn flush_second(
 
     // 1m close-only
     if let Some(mut closed_bar_1m) =
-        push_bucket(a1, Tf::M1, ts_ms_flush, sec_last_price, sec_delta_usdt)
+        aggregator::push_bucket(a1, Tf::M1, ts_ms_flush, sec_last_price, sec_delta_usdt)
     {
         *cvd_closed_usdt += closed_bar_1m.delta_usdt;
         closed_bar_1m.cvd_usdt = *cvd_closed_usdt;
@@ -1094,7 +584,7 @@ async fn flush_second(
 
     // 5m close-only
     if let Some(mut closed_bar_5m) =
-        push_bucket(a5, Tf::M5, ts_ms_flush, sec_last_price, sec_delta_usdt)
+        aggregator::push_bucket(a5, Tf::M5, ts_ms_flush, sec_last_price, sec_delta_usdt)
     {
         closed_bar_5m.cvd_usdt = *cvd_closed_usdt;
         push_publish(state, exchange, market, symbol, Tf::M5, closed_bar_5m).await;
@@ -1116,62 +606,12 @@ async fn flush_second(
     let _ = sh.tx_5m.send(live_bar_5m);
 }
 
-fn push_bucket(
-    agg: &mut BucketAgg,
-    tf: Tf,
-    ts_ms: i64,
-    price: f64,
-    delta_usdt: f64,
-) -> Option<Bar> {
-    let tf_ms = tf.ms();
-    let bucket_id = ts_ms / tf_ms;
-
-    match agg.cur_bucket_id {
-        None => agg.cur_bucket_id = Some(bucket_id),
-        Some(cur) if cur != bucket_id => {
-            if agg.trades == 0 || agg.last_price.is_nan() {
-                agg.cur_bucket_id = Some(bucket_id);
-                agg.last_price = price;
-                agg.delta_usdt = delta_usdt;
-                agg.trades = 1;
-                return None;
-            }
-
-            let end_ms = (cur + 1) * tf_ms - 1;
-            let end_sec = end_ms / 1000;
-
-            let bar = Bar {
-                time: end_sec,
-                price_close: agg.last_price,
-                delta_usdt: agg.delta_usdt,
-                cvd_usdt: 0.0,
-                trades: agg.trades,
-            };
-
-            agg.cur_bucket_id = Some(bucket_id);
-            agg.last_price = price;
-            agg.delta_usdt = delta_usdt;
-            agg.trades = 1;
-
-            return Some(bar);
-        }
-        _ => {}
-    }
-
-    agg.last_price = price;
-    agg.delta_usdt += delta_usdt;
-    agg.trades += 1;
-
-    None
-}
-
 async fn push_publish(state: &AppState, exchange: Exchange, market: Market, symbol: Symbol, tf: Tf, bar: Bar) {
     let exchange_str = exchange.as_str();
     let tf_str = tf.as_str();
     let market_str = market.as_str();
     let symbol_str = symbol.as_str();
 
-    // 1) persist (UPSERT)
     if let Err(e) = sqlx::query(
         r#"
         INSERT INTO bars (exchange, market, symbol, tf, time, price_close, delta_usdt, cvd_usdt, trades)
@@ -1201,7 +641,6 @@ async fn push_publish(state: &AppState, exchange: Exchange, market: Market, symb
         );
     }
 
-    // 2) in-memory history + ws broadcast for CLOSE bars
     let sh = pick_shard(state, exchange, market, symbol);
     let max = 4000usize;
 
@@ -1225,8 +664,12 @@ async fn push_publish(state: &AppState, exchange: Exchange, market: Market, symb
     }
 }
 
+pub fn parse_iso8601_to_ms(s: &str) -> Result<i64> {
+    let dt: DateTime<Utc> = s.parse()?;
+    Ok(dt.timestamp_millis())
+}
+
 fn backoff_with_jitter(attempt: u32) -> Duration {
-    // attempt==0 => 1s; grows to max 60s
     let exp = (1u64 << attempt.min(6)).min(60);
     let base = exp.max(1);
     let jitter_ms: u64 = rand::thread_rng().gen_range(0..=250);
