@@ -15,7 +15,4 @@ COPY static ./static
 
 EXPOSE 80
 
-ENV SQLITE_URL="sqlite:/data/cvd.db"
-RUN mkdir -p /data
-
 CMD ["cvd"]
