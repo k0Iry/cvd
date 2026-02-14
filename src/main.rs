@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use axum::extract::ws::{Message, WebSocket};
 use axum::{
     extract::{Query, State, WebSocketUpgrade},
@@ -6,6 +6,7 @@ use axum::{
     routing::get,
     Router,
 };
+use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -21,8 +22,28 @@ use tokio_tungstenite::connect_async;
 use tower_http::services::ServeDir;
 
 // ==============================
-// Types: Market / Symbol / Tf
+// Types: Exchange / Market / Symbol / Tf
 // ==============================
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+enum Exchange {
+    Binance,
+    Coinbase,
+}
+impl Exchange {
+    fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "coinbase" => Self::Coinbase,
+            _ => Self::Binance,
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Binance => "binance",
+            Self::Coinbase => "coinbase",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 enum Market {
@@ -96,6 +117,36 @@ impl Symbol {
             Self::AAVE => "aaveusd_perp",
         }
     }
+
+    // Coinbase product_id for trading pairs
+    fn coinbase_product_id(self) -> &'static str {
+        match self {
+            Self::BTC => "BTC-USD",
+            Self::ETH => "ETH-USD",
+            _ => "BTC-USD", // Only BTC and ETH for Coinbase
+        }
+    }
+}
+
+// Coinbase "match" message schema
+#[derive(Debug, Deserialize)]
+struct CoinbaseMatch {
+    #[serde(rename = "type")]
+    msg_type: String, // "match"
+    time: String, // ISO8601
+    product_id: String,
+    size: String,
+    price: String,
+    side: String, // maker side: "buy" or "sell"
+}
+
+// Coinbase subscribe request
+#[derive(Debug, Serialize)]
+struct CoinbaseSubscribe<'a> {
+    #[serde(rename = "type")]
+    msg_type: &'a str, // "subscribe"
+    product_ids: Vec<&'a str>,
+    channels: Vec<&'a str>, // ["matches"]
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -124,7 +175,14 @@ impl Tf {
     }
 }
 
-// ws URL builder
+// ws URL builders
+fn get_ws_url(exchange: Exchange, market: Market, symbol: Symbol) -> String {
+    match exchange {
+        Exchange::Binance => binance_ws_url(market, symbol),
+        Exchange::Coinbase => "wss://ws-feed.exchange.coinbase.com".to_string(),
+    }
+}
+
 fn binance_ws_url(market: Market, symbol: Symbol) -> String {
     let sym = match market {
         Market::Coinm => symbol.coinm_stream(),
@@ -254,12 +312,12 @@ fn mk_shard() -> Shard {
 
 #[derive(Clone)]
 struct AppState {
-    shards: Arc<HashMap<(Market, Symbol), Shard>>,
+    shards: Arc<HashMap<(Exchange, Market, Symbol), Shard>>,
     db: SqlitePool,
 }
 
-fn pick_shard(state: &AppState, market: Market, symbol: Symbol) -> &Shard {
-    state.shards.get(&(market, symbol)).expect("shard missing")
+fn pick_shard(state: &AppState, exchange: Exchange, market: Market, symbol: Symbol) -> &Shard {
+    state.shards.get(&(exchange, market, symbol)).expect("shard missing")
 }
 
 // ==============================
@@ -268,6 +326,7 @@ fn pick_shard(state: &AppState, market: Market, symbol: Symbol) -> &Shard {
 
 #[derive(Deserialize)]
 struct Params {
+    exchange: Option<String>,
     market: Option<String>,
     symbol: Option<String>,
     tf: Option<String>,
@@ -340,6 +399,7 @@ async fn init_db(db: &SqlitePool) -> Result<()> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS bars (
+            exchange TEXT NOT NULL,
             market TEXT NOT NULL,
             symbol TEXT NOT NULL,
             tf TEXT NOT NULL,
@@ -348,7 +408,7 @@ async fn init_db(db: &SqlitePool) -> Result<()> {
             delta_usdt REAL NOT NULL,
             cvd_usdt REAL NOT NULL,
             trades INTEGER NOT NULL,
-            PRIMARY KEY (market, symbol, tf, time)
+            PRIMARY KEY (exchange, market, symbol, tf, time)
         );
         "#,
     )
@@ -358,7 +418,7 @@ async fn init_db(db: &SqlitePool) -> Result<()> {
     sqlx::query(
         r#"
         CREATE INDEX IF NOT EXISTS idx_bars_query
-        ON bars(market, symbol, tf, time DESC);
+        ON bars(exchange, market, symbol, tf, time DESC);
         "#,
     )
     .execute(db)
@@ -369,6 +429,7 @@ async fn init_db(db: &SqlitePool) -> Result<()> {
 
 async fn load_history(
     db: &SqlitePool,
+    exchange: &str,
     market: &str,
     symbol: &str,
     tf: &str,
@@ -378,11 +439,12 @@ async fn load_history(
         r#"
         SELECT time, price_close, delta_usdt, cvd_usdt, trades
         FROM bars
-        WHERE market = ? AND symbol = ? AND tf = ?
+        WHERE exchange = ? AND market = ? AND symbol = ? AND tf = ?
         ORDER BY time DESC
         LIMIT ?
         "#,
     )
+    .bind(exchange)
     .bind(market)
     .bind(symbol)
     .bind(tf)
@@ -408,6 +470,7 @@ async fn load_history(
 
 async fn load_history_page(
     db: &SqlitePool,
+    exchange: &str,
     symbol: &str,
     market: &str,
     tf: &str,
@@ -421,12 +484,13 @@ async fn load_history_page(
             r#"
             SELECT time, price_close, delta_usdt, cvd_usdt, trades
             FROM bars
-            WHERE symbol = ? AND market = ? AND tf = ?
+            WHERE exchange = ? AND symbol = ? AND market = ? AND tf = ?
               AND time < ?
             ORDER BY time DESC
             LIMIT ?
             "#,
         )
+        .bind(exchange)
         .bind(symbol)
         .bind(market)
         .bind(tf)
@@ -439,11 +503,12 @@ async fn load_history_page(
             r#"
             SELECT time, price_close, delta_usdt, cvd_usdt, trades
             FROM bars
-            WHERE symbol = ? AND market = ? AND tf = ?
+            WHERE exchange = ? AND symbol = ? AND market = ? AND tf = ?
             ORDER BY time DESC
             LIMIT ?
             "#,
         )
+        .bind(exchange)
         .bind(symbol)
         .bind(market)
         .bind(tf)
@@ -467,13 +532,14 @@ async fn load_history_page(
     Ok(v)
 }
 
-async fn hydrate_shard(state: &AppState, market: Market, symbol: Symbol) -> Result<()> {
+async fn hydrate_shard(state: &AppState, exchange: Exchange, market: Market, symbol: Symbol) -> Result<()> {
+    let e = exchange.as_str();
     let m = market.as_str();
     let s = symbol.as_str();
-    let (h1, last1) = load_history(&state.db, m, s, "1m", 4000).await?;
-    let (h5, _last5) = load_history(&state.db, m, s, "5m", 4000).await?;
+    let (h1, last1) = load_history(&state.db, e, m, s, "1m", 4000).await?;
+    let (h5, _last5) = load_history(&state.db, e, m, s, "5m", 4000).await?;
 
-    let sh = pick_shard(state, market, symbol);
+    let sh = pick_shard(state, exchange, market, symbol);
     *sh.hist_1m.write().await = h1;
     *sh.hist_5m.write().await = h5;
     *sh.cvd_closed_usdt.write().await = last1;
@@ -498,8 +564,9 @@ async fn main() -> Result<()> {
 
     init_db(&db).await?;
 
-    // build shards for all market×symbol
-    let mut shards: HashMap<(Market, Symbol), Shard> = HashMap::new();
+    // build shards for all exchange × market × symbol
+    let mut shards: HashMap<(Exchange, Market, Symbol), Shard> = HashMap::new();
+    let exchanges = [Exchange::Binance, Exchange::Coinbase];
     let markets = [Market::Spot, Market::Usdm, Market::Coinm];
     let symbols = [
         Symbol::BTC,
@@ -509,9 +576,21 @@ async fn main() -> Result<()> {
         Symbol::AAVE,
     ];
 
-    for &m in &markets {
-        for &s in &symbols {
-            shards.insert((m, s), mk_shard());
+    for &ex in &exchanges {
+        for &m in &markets {
+            // Coinbase only has Spot market
+            if ex == Exchange::Coinbase && m != Market::Spot {
+                continue;
+            }
+            // Coinbase only supports BTC and ETH
+            let syms = if ex == Exchange::Coinbase {
+                &[Symbol::BTC, Symbol::ETH]
+            } else {
+                &symbols[..]
+            };
+            for &s in syms {
+                shards.insert((ex, m, s), mk_shard());
+            }
         }
     }
 
@@ -521,16 +600,36 @@ async fn main() -> Result<()> {
     };
 
     // hydrate histories for each shard
-    for &m in &markets {
-        for &s in &symbols {
-            hydrate_shard(&state, m, s).await?;
+    for &ex in &exchanges {
+        for &m in &markets {
+            if ex == Exchange::Coinbase && m != Market::Spot {
+                continue;
+            }
+            let syms = if ex == Exchange::Coinbase {
+                &[Symbol::BTC, Symbol::ETH]
+            } else {
+                &symbols[..]
+            };
+            for &s in syms {
+                hydrate_shard(&state, ex, m, s).await?;
+            }
         }
     }
 
-    // start 15 engines concurrently
-    for &m in &markets {
-        for &s in &symbols {
-            tokio::spawn(engine_loop(state.clone(), m, s));
+    // start engines concurrently for each exchange × market × symbol
+    for &ex in &exchanges {
+        for &m in &markets {
+            if ex == Exchange::Coinbase && m != Market::Spot {
+                continue;
+            }
+            let syms = if ex == Exchange::Coinbase {
+                &[Symbol::BTC, Symbol::ETH]
+            } else {
+                &symbols[..]
+            };
+            for &s in syms {
+                tokio::spawn(engine_loop(state.clone(), ex, m, s));
+            }
         }
     }
 
@@ -553,13 +652,14 @@ async fn main() -> Result<()> {
 // ==============================
 
 async fn history(State(state): State<AppState>, Query(p): Query<Params>) -> impl IntoResponse {
+    let exchange = p.exchange.as_deref().unwrap_or("binance");
     let symbol = p.symbol.as_deref().unwrap_or("BTC");
     let market = p.market.as_deref().unwrap_or("spot");
     let tf = p.tf.as_deref().unwrap_or("1m");
     let limit = p.limit.unwrap_or(800).min(4000);
     let before = p.before;
 
-    match load_history_page(&state.db, symbol, market, tf, limit, before).await {
+    match load_history_page(&state.db, exchange, symbol, market, tf, limit, before).await {
         Ok(bars) => Json(bars).into_response(),
         Err(e) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -574,20 +674,22 @@ async fn ws_upgrade(
     State(state): State<AppState>,
     Query(p): Query<Params>,
 ) -> impl IntoResponse {
+    let exchange = Exchange::from_str(p.exchange.as_deref().unwrap_or("binance"));
     let market = Market::from_str(p.market.as_deref().unwrap_or("spot"));
     let symbol = Symbol::from_str(p.symbol.as_deref().unwrap_or("BTC"));
     let tf = Tf::from_str(p.tf.as_deref().unwrap_or("1m"));
-    ws.on_upgrade(move |socket| ws_handler(socket, state, market, symbol, tf))
+    ws.on_upgrade(move |socket| ws_handler(socket, state, exchange, market, symbol, tf))
 }
 
 async fn ws_handler(
     mut socket: WebSocket,
     state: AppState,
+    exchange: Exchange,
     market: Market,
     symbol: Symbol,
     tf: Tf,
 ) {
-    let sh = pick_shard(&state, market, symbol).clone();
+    let sh = pick_shard(&state, exchange, market, symbol).clone();
 
     let mut rx = match tf {
         Tf::M1 => sh.tx_1m.subscribe(),
@@ -624,11 +726,11 @@ async fn ws_handler(
 // Engine
 // ==============================
 
-async fn engine_loop(state: AppState, market: Market, symbol: Symbol) {
+async fn engine_loop(state: AppState, exchange: Exchange, market: Market, symbol: Symbol) {
     let mut attempt: u32 = 0;
 
     loop {
-        let res = run_engine_once(&state, market, symbol).await;
+        let res = run_engine_once(&state, exchange, market, symbol).await;
 
         match res {
             Ok(_) => attempt = 0,
@@ -638,7 +740,8 @@ async fn engine_loop(state: AppState, market: Market, symbol: Symbol) {
                     attempt = 0;
                 } else {
                     eprintln!(
-                        "[{}:{}] engine error: {e}",
+                        "[{}:{}:{}] engine error: {e}",
+                        exchange.as_str(),
                         market.as_str(),
                         symbol.as_str()
                     );
@@ -649,7 +752,8 @@ async fn engine_loop(state: AppState, market: Market, symbol: Symbol) {
 
         let wait = backoff_with_jitter(attempt);
         eprintln!(
-            "[{}:{}] reconnecting in {:.3}s (attempt={})",
+            "[{}:{}:{}] reconnecting in {:.3}s (attempt={})",
+            exchange.as_str(),
             market.as_str(),
             symbol.as_str(),
             wait.as_secs_f64(),
@@ -659,10 +763,11 @@ async fn engine_loop(state: AppState, market: Market, symbol: Symbol) {
     }
 }
 
-async fn run_engine_once(state: &AppState, market: Market, symbol: Symbol) -> Result<()> {
-    let url = binance_ws_url(market, symbol);
+async fn run_engine_once(state: &AppState, exchange: Exchange, market: Market, symbol: Symbol) -> Result<()> {
+    let url = get_ws_url(exchange, market, symbol);
     eprintln!(
-        "[{}:{}] Connecting to: {}",
+        "[{}:{}:{}] Connecting to: {}",
+        exchange.as_str(),
         market.as_str(),
         symbol.as_str(),
         url
@@ -671,8 +776,29 @@ async fn run_engine_once(state: &AppState, market: Market, symbol: Symbol) -> Re
     let (ws_stream, _resp) = connect_async(&url).await?;
     let (mut write, mut read) = ws_stream.split();
 
-    let sh = pick_shard(state, market, symbol);
+    let sh = pick_shard(state, exchange, market, symbol);
 
+    match exchange {
+        Exchange::Binance => run_binance_engine(state, exchange, market, symbol, &sh, write, read).await,
+        Exchange::Coinbase => run_coinbase_engine(state, exchange, market, symbol, &sh, write, read).await,
+    }
+}
+
+// Helper to parse ISO8601 timestamps to milliseconds
+fn parse_iso8601_to_ms(s: &str) -> Result<i64> {
+    let dt: DateTime<Utc> = s.parse()?;
+    Ok(dt.timestamp_millis())
+}
+
+async fn run_binance_engine(
+    state: &AppState,
+    exchange: Exchange,
+    market: Market,
+    symbol: Symbol,
+    sh: &Shard,
+    mut write: futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, tokio_tungstenite::tungstenite::Message>,
+    mut read: futures::stream::SplitStream<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>,
+) -> Result<()> {
     let mut cvd_closed_usdt = *sh.cvd_closed_usdt.read().await;
 
     let mut sec = SecAgg::new();
@@ -683,7 +809,7 @@ async fn run_engine_once(state: &AppState, market: Market, symbol: Symbol) -> Re
         let msg = match msg {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("[{}:{}] read err: {e}", market.as_str(), symbol.as_str());
+                eprintln!("[{}:{}:{}] read err: {e}", exchange.as_str(), market.as_str(), symbol.as_str());
                 break;
             }
         };
@@ -729,6 +855,7 @@ async fn run_engine_once(state: &AppState, market: Market, symbol: Symbol) -> Re
 
                         flush_second(
                             state,
+                            exchange,
                             market,
                             symbol,
                             &mut a1,
@@ -757,6 +884,7 @@ async fn run_engine_once(state: &AppState, market: Market, symbol: Symbol) -> Re
     if let Some(s) = sec.cur_sec {
         flush_second(
             state,
+            exchange,
             market,
             symbol,
             &mut a1,
@@ -772,11 +900,161 @@ async fn run_engine_once(state: &AppState, market: Market, symbol: Symbol) -> Re
         *sh.cvd_closed_usdt.write().await = cvd_closed_usdt;
     }
 
-    Err(anyhow::anyhow!("ws ended"))
+    Err(anyhow!("ws ended"))
+}
+
+async fn run_coinbase_engine(
+    state: &AppState,
+    exchange: Exchange,
+    market: Market,
+    symbol: Symbol,
+    sh: &Shard,
+    mut write: futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, tokio_tungstenite::tungstenite::Message>,
+    mut read: futures::stream::SplitStream<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>,
+) -> Result<()> {
+    // Subscribe to matches for BTC-USD + ETH-USD
+    let product_ids = match symbol {
+        Symbol::BTC => vec!["BTC-USD"],
+        Symbol::ETH => vec!["ETH-USD"],
+        _ => return Err(anyhow!("Coinbase only supports BTC and ETH")),
+    };
+
+    let sub = CoinbaseSubscribe {
+        msg_type: "subscribe",
+        product_ids,
+        channels: vec!["matches"],
+    };
+    write
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&sub)?,
+        ))
+        .await?;
+
+    let mut cvd_closed_usdt = *sh.cvd_closed_usdt.read().await;
+    let mut sec = SecAgg::new();
+    let mut a1 = BucketAgg::new();
+    let mut a5 = BucketAgg::new();
+
+    let mut ping = tokio::time::interval(Duration::from_secs(20));
+    loop {
+        tokio::select! {
+            _ = ping.tick() => {
+                // Keep-alive ping
+                let _ = write.send(
+                    tokio_tungstenite::tungstenite::Message::Ping(vec![])
+                ).await;
+            }
+
+            msg = read.next() => {
+                let msg = match msg {
+                    Some(Ok(m)) => m,
+                    Some(Err(e)) => return Err(e.into()),
+                    None => break,
+                };
+
+                match msg {
+                    tokio_tungstenite::tungstenite::Message::Ping(payload) => {
+                        write
+                            .send(tokio_tungstenite::tungstenite::Message::Pong(payload))
+                            .await?;
+                    }
+                    tokio_tungstenite::tungstenite::Message::Text(txt) => {
+                        let m: CoinbaseMatch = match serde_json::from_str(&txt) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        if m.msg_type != "match" {
+                            continue;
+                        }
+
+                        let expected_product = match symbol {
+                            Symbol::BTC => "BTC-USD",
+                            Symbol::ETH => "ETH-USD",
+                            _ => unreachable!(),
+                        };
+                        if m.product_id != expected_product {
+                            continue;
+                        }
+
+                        let price: f64 = match m.price.parse() {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        let size: f64 = match m.size.parse() {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+
+                        // side: "buy" (taker buy) => positive, "sell" (taker sell) => negative
+                        let signed_size = if m.side == "sell" { size } else { -size };
+                        let delta_usdt = signed_size * price;
+
+                        let ts_ms = parse_iso8601_to_ms(&m.time)?;
+                        let this_sec = ts_ms / 1000;
+
+                        match sec.cur_sec {
+                            None => sec.reset_to(this_sec, price, delta_usdt),
+                            Some(s) if s != this_sec => {
+                                let sec_ended = s;
+                                let sec_last_price = sec.last_price;
+                                let sec_delta = sec.delta_usdt;
+                                let sec_trades = sec.trades;
+
+                                flush_second(
+                                    state,
+                                    exchange,
+                                    market,
+                                    symbol,
+                                    &mut a1,
+                                    &mut a5,
+                                    &mut cvd_closed_usdt,
+                                    sec_ended,
+                                    sec_last_price,
+                                    sec_delta,
+                                    sec_trades,
+                                )
+                                .await;
+
+                                *sh.cvd_closed_usdt.write().await = cvd_closed_usdt;
+
+                                sec.reset_to(this_sec, price, delta_usdt);
+                            }
+                            _ => sec.add(price, delta_usdt),
+                        }
+                    }
+                    tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // flush last partial second (best-effort)
+    if let Some(s) = sec.cur_sec {
+        flush_second(
+            state,
+            exchange,
+            market,
+            symbol,
+            &mut a1,
+            &mut a5,
+            &mut cvd_closed_usdt,
+            s,
+            sec.last_price,
+            sec.delta_usdt,
+            sec.trades,
+        )
+        .await;
+
+        *sh.cvd_closed_usdt.write().await = cvd_closed_usdt;
+    }
+
+    Err(anyhow!("ws ended"))
 }
 
 async fn flush_second(
     state: &AppState,
+    exchange: Exchange,
     market: Market,
     symbol: Symbol,
     a1: &mut BucketAgg,
@@ -795,7 +1073,7 @@ async fn flush_second(
     {
         *cvd_closed_usdt += closed_bar_1m.delta_usdt;
         closed_bar_1m.cvd_usdt = *cvd_closed_usdt;
-        push_publish(state, market, symbol, Tf::M1, closed_bar_1m).await;
+        push_publish(state, exchange, market, symbol, Tf::M1, closed_bar_1m).await;
     }
 
     // 1m live every second (update last point)
@@ -811,7 +1089,7 @@ async fn flush_second(
         trades: a1.trades,
     };
 
-    let sh = pick_shard(state, market, symbol);
+    let sh = pick_shard(state, exchange, market, symbol);
     let _ = sh.tx_1m.send(live_bar_1m);
 
     // 5m close-only
@@ -819,7 +1097,7 @@ async fn flush_second(
         push_bucket(a5, Tf::M5, ts_ms_flush, sec_last_price, sec_delta_usdt)
     {
         closed_bar_5m.cvd_usdt = *cvd_closed_usdt;
-        push_publish(state, market, symbol, Tf::M5, closed_bar_5m).await;
+        push_publish(state, exchange, market, symbol, Tf::M5, closed_bar_5m).await;
     }
 }
 
@@ -872,7 +1150,8 @@ fn push_bucket(
     None
 }
 
-async fn push_publish(state: &AppState, market: Market, symbol: Symbol, tf: Tf, bar: Bar) {
+async fn push_publish(state: &AppState, exchange: Exchange, market: Market, symbol: Symbol, tf: Tf, bar: Bar) {
+    let exchange_str = exchange.as_str();
     let tf_str = tf.as_str();
     let market_str = market.as_str();
     let symbol_str = symbol.as_str();
@@ -880,15 +1159,16 @@ async fn push_publish(state: &AppState, market: Market, symbol: Symbol, tf: Tf, 
     // 1) persist (UPSERT)
     if let Err(e) = sqlx::query(
         r#"
-        INSERT INTO bars (market, symbol, tf, time, price_close, delta_usdt, cvd_usdt, trades)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(market, symbol, tf, time) DO UPDATE SET
+        INSERT INTO bars (exchange, market, symbol, tf, time, price_close, delta_usdt, cvd_usdt, trades)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(exchange, market, symbol, tf, time) DO UPDATE SET
             price_close=excluded.price_close,
             delta_usdt=excluded.delta_usdt,
             cvd_usdt=excluded.cvd_usdt,
             trades=excluded.trades
         "#,
     )
+    .bind(exchange_str)
     .bind(market_str)
     .bind(symbol_str)
     .bind(tf_str)
@@ -901,13 +1181,13 @@ async fn push_publish(state: &AppState, market: Market, symbol: Symbol, tf: Tf, 
     .await
     {
         eprintln!(
-            "db write failed market={} symbol={} tf={} time={} err={e}",
-            market_str, symbol_str, tf_str, bar.time
+            "db write failed exchange={} market={} symbol={} tf={} time={} err={e}",
+            exchange_str, market_str, symbol_str, tf_str, bar.time
         );
     }
 
     // 2) in-memory history + ws broadcast for CLOSE bars
-    let sh = pick_shard(state, market, symbol);
+    let sh = pick_shard(state, exchange, market, symbol);
     let max = 4000usize;
 
     match tf {
