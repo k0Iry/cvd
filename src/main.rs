@@ -1099,6 +1099,21 @@ async fn flush_second(
         closed_bar_5m.cvd_usdt = *cvd_closed_usdt;
         push_publish(state, exchange, market, symbol, Tf::M5, closed_bar_5m).await;
     }
+
+    // 5m live every second (update last point)
+    let tf_ms = Tf::M5.ms();
+    let cur_bucket_id = ts_ms_flush / tf_ms;
+    let cur_end_ms = (cur_bucket_id + 1) * tf_ms - 1;
+
+    let live_bar_5m = Bar {
+        time: cur_end_ms / 1000,
+        price_close: a5.last_price,
+        delta_usdt: a5.delta_usdt,
+        cvd_usdt: *cvd_closed_usdt + a5.delta_usdt,
+        trades: a5.trades,
+    };
+
+    let _ = sh.tx_5m.send(live_bar_5m);
 }
 
 fn push_bucket(
