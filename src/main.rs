@@ -63,6 +63,18 @@ fn pick_shard(state: &AppState, exchange: Exchange, market: Market, symbol: Symb
     state.shards.get(&(exchange, market, symbol)).expect("shard missing")
 }
 
+// Helper: Get valid (market, symbol) pairs for a given exchange
+fn get_market_symbol_pairs(exchange: Exchange) -> Vec<(Market, Symbol)> {
+    match exchange {
+        Exchange::Coinbase => vec![(Market::Spot, Symbol::Btc), (Market::Spot, Symbol::Eth)],
+        Exchange::Binance => {
+            let markets = [Market::Spot, Market::Usdm, Market::Coinm];
+            let symbols = [Symbol::Btc, Symbol::Eth, Symbol::Sol, Symbol::Bnb, Symbol::Aave];
+            markets.iter().flat_map(|&m| symbols.iter().map(move |&s| (m, s))).collect()
+        }
+    }
+}
+
 // ==============================
 // HTTP params
 // ==============================
@@ -192,6 +204,11 @@ async fn load_history(
     .fetch_all(db)
     .await?;
 
+    let (v, last_cvd) = convert_rows_to_bars(rows);
+    Ok((VecDeque::from(v), last_cvd))
+}
+
+fn convert_rows_to_bars(rows: Vec<models::BarRow>) -> (Vec<Bar>, f64) {
     let mut v: Vec<Bar> = rows
         .into_iter()
         .map(|r| Bar {
@@ -203,9 +220,8 @@ async fn load_history(
         })
         .collect();
     v.reverse();
-
     let last_cvd = v.last().map(|b| b.cvd_usdt).unwrap_or(0.0);
-    Ok((VecDeque::from(v), last_cvd))
+    (v, last_cvd)
 }
 
 async fn load_history_page(
@@ -257,17 +273,7 @@ async fn load_history_page(
         .await?
     };
 
-    let mut v: Vec<Bar> = rows
-        .into_iter()
-        .map(|r| Bar {
-            time: r.time,
-            price_close: r.price_close,
-            delta_usdt: r.delta_usdt,
-            cvd_usdt: r.cvd_usdt,
-            trades: r.trades as u64,
-        })
-        .collect();
-    v.reverse();
+    let (v, _) = convert_rows_to_bars(rows);
     Ok(v)
 }
 
@@ -305,28 +311,10 @@ async fn main() -> Result<()> {
     // build shards for all exchange × market × symbol
     let mut shards: HashMap<(Exchange, Market, Symbol), Shard> = HashMap::new();
     let exchanges = [Exchange::Binance, Exchange::Coinbase];
-    let markets = [Market::Spot, Market::Usdm, Market::Coinm];
-    let symbols = [
-        Symbol::Btc,
-        Symbol::Eth,
-        Symbol::Sol,
-        Symbol::Bnb,
-        Symbol::Aave,
-    ];
 
     for &ex in &exchanges {
-        for &m in &markets {
-            if ex == Exchange::Coinbase && m != Market::Spot {
-                continue;
-            }
-            let syms = if ex == Exchange::Coinbase {
-                &[Symbol::Btc, Symbol::Eth]
-            } else {
-                &symbols[..]
-            };
-            for &s in syms {
-                shards.insert((ex, m, s), mk_shard());
-            }
+        for (m, s) in get_market_symbol_pairs(ex) {
+            shards.insert((ex, m, s), mk_shard());
         }
     }
 
@@ -338,36 +326,16 @@ async fn main() -> Result<()> {
 
     // hydrate histories for each shard
     for &ex in &exchanges {
-        for &m in &markets {
-            if ex == Exchange::Coinbase && m != Market::Spot {
-                continue;
-            }
-            let syms = if ex == Exchange::Coinbase {
-                &[Symbol::Btc, Symbol::Eth]
-            } else {
-                &symbols[..]
-            };
-            for &s in syms {
-                hydrate_shard(&state, ex, m, s).await?;
-            }
+        for (m, s) in get_market_symbol_pairs(ex) {
+            hydrate_shard(&state, ex, m, s).await?;
         }
     }
 
     // start engines concurrently for each exchange × market × symbol
     for &ex in &exchanges {
-        for &m in &markets {
-            if ex == Exchange::Coinbase && m != Market::Spot {
-                continue;
-            }
-            let syms = if ex == Exchange::Coinbase {
-                &[Symbol::Btc, Symbol::Eth]
-            } else {
-                &symbols[..]
-            };
-            for &s in syms {
-                let state_clone = state.clone();
-                tokio::spawn(engine_loop(state_clone, ex, m, s));
-            }
+        for (m, s) in get_market_symbol_pairs(ex) {
+            let state_clone = state.clone();
+            tokio::spawn(engine_loop(state_clone, ex, m, s));
         }
     }
 
