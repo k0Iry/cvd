@@ -3,7 +3,11 @@
 
 <head>
     <meta charset="utf-8" />
-    <title>CVD (Binance)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
+    <title>CVD</title>
     <style>
         body {
             margin: 0;
@@ -106,6 +110,30 @@
 
     <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
     <script>
+        // ==================== CONFIG ====================
+        const CONFIG = {
+            HISTORY_PAGE_SIZE: 800,
+            MAX_CACHED_BARS: 4000,
+            LOAD_TRIGGER: 30, // bars from left edge
+            WS_RECONNECT_DELAY: 3000, // ms
+            WS_MAX_RECONNECT_ATTEMPTS: 10,
+            FETCH_TIMEOUT: 10000, // ms
+            STORAGE_KEY_PREFIX: 'cvd_',
+        };
+
+        // ==================== EXCHANGE/MARKET CONFIG ====================
+        const EXCHANGE_CONFIG = {
+            binance: {
+                markets: ['spot', 'usdm', 'coinm'],
+                symbols: ['BTC', 'ETH', 'SOL', 'BNB', 'AAVE'],
+            },
+            coinbase: {
+                markets: ['spot'],
+                symbols: ['BTC', 'ETH'],
+            },
+        };
+
+        // ==================== DOM ELEMENTS ====================
         const exchangeSel = document.getElementById("exchange");
         const symbolSel = document.getElementById("symbol");
         const marketSel = document.getElementById("market");
@@ -115,24 +143,29 @@
 
         const API = "";
 
-        // Coinbase only supports Spot market and BTC/ETH
+        // Update market/symbol options based on selected exchange
         function updateMarketOptions() {
             const exchange = exchangeSel.value;
+            const config = EXCHANGE_CONFIG[exchange];
+            if (!config) return;
+
             const currentMarket = marketSel.value;
-            
-            if (exchange === "coinbase") {
-                // Coinbase only supports Spot
-                marketSel.innerHTML = '<option>spot</option>';
-                if (currentMarket !== "spot") marketSel.value = "spot";
-                
-                // Limit symbols to BTC and ETH
-                const currentSymbol = symbolSel.value;
-                symbolSel.innerHTML = '<option>BTC</option><option>ETH</option>';
-                if (currentSymbol !== "BTC" && currentSymbol !== "ETH") symbolSel.value = "BTC";
+            const currentSymbol = symbolSel.value;
+
+            // Update markets
+            marketSel.innerHTML = config.markets.map(m => `<option>${m}</option>`).join('');
+            if (!currentMarket || !config.markets.includes(currentMarket)) {
+                marketSel.value = config.markets[0];
             } else {
-                // Binance supports all
-                marketSel.innerHTML = '<option>spot</option><option>usdm</option><option>coinm</option>';
-                symbolSel.innerHTML = '<option>BTC</option><option>ETH</option><option>SOL</option><option>BNB</option><option>AAVE</option>';
+                marketSel.value = currentMarket;
+            }
+
+            // Update symbols
+            symbolSel.innerHTML = config.symbols.map(s => `<option>${s}</option>`).join('');
+            if (!currentSymbol || !config.symbols.includes(currentSymbol)) {
+                symbolSel.value = config.symbols[0];
+            } else {
+                symbolSel.value = currentSymbol;
             }
         }
 
@@ -157,12 +190,17 @@
             });
         }
 
+        // ==================== CHARTS ====================
         const priceEl = document.getElementById("price");
         const cvdEl = document.getElementById("cvd");
         const priceChart = mkChart(priceEl);
         const cvdChart = mkChart(cvdEl);
 
-        const priceSeries = priceChart.addLineSeries({ color: "#f2c94c", lineWidth: 2 });
+        const priceSeries = priceChart.addLineSeries({
+            color: "#f2c94c",
+            lineWidth: 2,
+            priceLineVisible: true,
+        });
         const cvdSeries = cvdChart.addLineSeries({
             color: "#56ccf2",
             lineWidth: 2,
@@ -217,20 +255,13 @@
         applyTz(priceChart);
         applyTz(cvdChart);
 
-        tzSel.onchange = () => {
-            currentTz = tzSel.value;
-            applyTz(priceChart);
-            applyTz(cvdChart);
-        };
-
         /* ---------- paging + in-memory ---------- */
+        // Page state
         const page = {
             bars: [],
             oldestTime: null,
             loadingMore: false,
             reachedStart: false,
-            pageSize: 800,
-            maxKeep: 4000,
             lastKey: "",
         };
 
@@ -251,10 +282,11 @@
             const curFirst = currentBars.length ? currentBars[0].time : null;
             const filteredOlder = (curFirst == null) ? olderBars : olderBars.filter(b => b.time < curFirst);
             const merged = [...filteredOlder, ...currentBars];
-            if (merged.length > page.maxKeep) return merged.slice(merged.length - page.maxKeep);
+            if (merged.length > CONFIG.MAX_CACHED_BARS) return merged.slice(merged.length - CONFIG.MAX_CACHED_BARS);
             return merged;
         }
 
+        // Fetch history with timeout and error handling
         async function fetchHistory(exchange, symbol, market, tf, limit, before) {
             const u = new URL(`${API}/history`, location.origin);
             u.searchParams.set("exchange", exchange);
@@ -263,8 +295,17 @@
             u.searchParams.set("tf", tf);
             u.searchParams.set("limit", String(limit));
             if (before != null) u.searchParams.set("before", String(before));
-            const r = await fetch(u);
-            return r.ok ? r.json() : [];
+
+            try {
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), CONFIG.FETCH_TIMEOUT);
+                const r = await fetch(u, { signal: controller.signal });
+                clearTimeout(timeout);
+                return r.ok ? await r.json() : [];
+            } catch (err) {
+                console.warn('Fetch error:', err.message);
+                return [];
+            }
         }
 
         async function loadInitial(exchange, symbol, market, tf) {
@@ -272,7 +313,7 @@
             page.loadingMore = false;
             page.reachedStart = false;
 
-            const bars = await fetchHistory(exchange, symbol, market, tf, page.pageSize, null);
+            const bars = await fetchHistory(exchange, symbol, market, tf, CONFIG.HISTORY_PAGE_SIZE, null);
             setBars(Array.isArray(bars) ? bars : []);
             priceChart.timeScale().scrollToRealTime();
             statusEl.textContent = "live";
@@ -288,7 +329,7 @@
             const oldLen = page.bars.length;
 
             try {
-                const older = await fetchHistory(exchange, symbol, market, tf, page.pageSize, page.oldestTime);
+                const older = await fetchHistory(exchange, symbol, market, tf, CONFIG.HISTORY_PAGE_SIZE, page.oldestTime);
                 const olderBars = Array.isArray(older) ? older : [];
                 if (!olderBars.length) { page.reachedStart = true; return; }
 
@@ -307,63 +348,133 @@
             }
         }
 
-        // 拖到最左边附近就翻页
+        // Load more bars when scrolling to the left edge
         priceChart.timeScale().subscribeVisibleLogicalRangeChange((r) => {
             if (!r) return;
-            if (r.from <= 30) {
+            if (r.from <= CONFIG.LOAD_TRIGGER) {
                 loadMoreBefore(exchangeSel.value, symbolSel.value, marketSel.value, tfSel.value);
             }
         });
 
-        /* ---------- websocket ---------- */
+        // ==================== WEBSOCKET ====================
         let ws = null;
         let wsWant = {};
         let lastWsTime = 0;
+        let wsReconnectAttempts = 0;
+        let wsReconnectTimeout = null;
+
+        function closeWs() {
+            if (ws) {
+                try {
+                    ws.onopen = ws.onclose = ws.onmessage = ws.onerror = null;
+                    ws.close();
+                } catch { }
+                ws = null;
+            }
+            if (wsReconnectTimeout) clearTimeout(wsReconnectTimeout);
+        }
 
         function connectWs(exchange, symbol, market, tf) {
-            wsWant = { exchange, symbol, market, tf };
-            lastWsTime = 0;
+            const wantKey = `${exchange}|${symbol}|${market}|${tf}`;
+            if (wsWant.key === wantKey && ws && ws.readyState === WebSocket.OPEN) {
+                return; // Already connected
+            }
 
-            if (ws) { try { ws.onopen = ws.onclose = ws.onmessage = ws.onerror = null; ws.close(); } catch { }; ws = null; }
+            wsWant = { exchange, symbol, market, tf, key: wantKey };
+            lastWsTime = 0;
+            wsReconnectAttempts = 0;
+
+            closeWs();
 
             const proto = location.protocol === "https:" ? "wss" : "ws";
             ws = new WebSocket(`${proto}://${location.host}${API}/ws?exchange=${exchange}&symbol=${symbol}&market=${market}&tf=${tf}`);
             statusEl.textContent = "connecting…";
 
-            ws.onopen = () => statusEl.textContent = "live";
+            ws.onopen = () => {
+                wsReconnectAttempts = 0;
+                statusEl.textContent = "live";
+            };
 
             ws.onmessage = (ev) => {
-                if (wsWant.exchange !== exchange || wsWant.symbol !== symbol || wsWant.market !== market || wsWant.tf !== tf) return;
+                if (wsWant.key !== wantKey) return; // Ignore if no longer wanted
 
                 let b;
-                try { b = JSON.parse(ev.data); } catch { return; }
+                try {
+                    b = JSON.parse(ev.data);
+                } catch (err) {
+                    console.warn('JSON parse error:', err.message);
+                    return;
+                }
                 if (typeof b.time !== "number") return;
 
-                // 注意：这里保持你原逻辑：<= 就丢（避免乱序/回放）
-                if (b.time < lastWsTime) return;
+                if (b.time < lastWsTime) return; // Ignore out-of-order messages
                 lastWsTime = b.time;
 
                 const bars = page.bars;
                 const last = bars[bars.length - 1];
 
                 if (last && last.time === b.time) {
-                    bars[bars.length - 1] = b;
+                    bars[bars.length - 1] = b; // Update existing
                 } else if (!last || b.time > last.time) {
-                    bars.push(b);
-                    if (bars.length > page.maxKeep) bars.shift();
+                    bars.push(b); // Append new
+                    if (bars.length > CONFIG.MAX_CACHED_BARS) bars.shift();
                 }
 
-                // ✅ 只 update，不 setData
                 if (typeof b.price_close === "number") priceSeries.update({ time: b.time, value: b.price_close });
                 if (typeof b.cvd_usdt === "number") cvdSeries.update({ time: b.time, value: b.cvd_usdt });
 
                 page.oldestTime = bars.length ? bars[0].time : null;
             };
 
-            ws.onclose = () => statusEl.textContent = "disconnected";
+            ws.onerror = (err) => {
+                console.error('WebSocket error:', err);
+                statusEl.textContent = "error";
+            };
+
+            ws.onclose = () => {
+                if (wsWant.key !== wantKey) return; // Already switched
+                wsReconnectAttempts++;
+                if (wsReconnectAttempts <= CONFIG.WS_MAX_RECONNECT_ATTEMPTS) {
+                    statusEl.textContent = `reconnecting (${wsReconnectAttempts}/${CONFIG.WS_MAX_RECONNECT_ATTEMPTS})…`;
+                    wsReconnectTimeout = setTimeout(
+                        () => connectWs(exchange, symbol, market, tf),
+                        CONFIG.WS_RECONNECT_DELAY
+                    );
+                } else {
+                    statusEl.textContent = "disconnected";
+                }
+            };
         }
 
-        /* ---------- reload ---------- */
+        // ==================== PERSISTENCE ====================
+        function savePreferences() {
+            const prefs = {
+                exchange: exchangeSel.value,
+                symbol: symbolSel.value,
+                market: marketSel.value,
+                tf: tfSel.value,
+                tz: tzSel.value,
+            };
+            localStorage.setItem(CONFIG.STORAGE_KEY_PREFIX + 'prefs', JSON.stringify(prefs));
+        }
+
+        function loadPreferences() {
+            const stored = localStorage.getItem(CONFIG.STORAGE_KEY_PREFIX + 'prefs');
+            if (!stored) return;
+            try {
+                const prefs = JSON.parse(stored);
+                if (prefs.exchange && EXCHANGE_CONFIG[prefs.exchange]) exchangeSel.value = prefs.exchange;
+                updateMarketOptions();
+                if (prefs.market && prefs.market !== marketSel.value) marketSel.value = prefs.market;
+                if (prefs.symbol && prefs.symbol !== symbolSel.value) symbolSel.value = prefs.symbol;
+                if (prefs.tf) tfSel.value = prefs.tf;
+                if (prefs.tz) tzSel.value = prefs.tz;
+            } catch (err) {
+                console.warn('Failed to load preferences:', err);
+            }
+        }
+
+        // ==================== RELOAD & LISTENERS ====================
         async function reload() {
             const e = exchangeSel.value, s = symbolSel.value, m = marketSel.value, tf = tfSel.value;
             const key = `${e}|${s}|${m}|${tf}`;
@@ -374,16 +485,38 @@
                 page.loadingMore = false;
                 page.reachedStart = false;
             }
+            savePreferences();
+            updateTitle();
             await loadInitial(e, s, m, tf);
             connectWs(e, s, m, tf);
         }
 
+        function updateTitle() {
+            const e = exchangeSel.value.toUpperCase();
+            const s = symbolSel.value;
+            const m = marketSel.value.toUpperCase();
+            const tf = tfSel.value;
+            document.title = `${s} ${m} (${e}) ${tf}`;
+        }
+
+        exchangeSel.onchange = () => {
+            updateMarketOptions();
+            reload();
+        };
         symbolSel.onchange = reload;
         marketSel.onchange = reload;
         tfSel.onchange = reload;
+        tzSel.onchange = () => {
+            currentTz = tzSel.value;
+            savePreferences();
+            applyTz(priceChart);
+            applyTz(cvdChart);
+        };
 
-        // Initialize market options and reload
+        // Initialize: load saved preferences, then reload
+        loadPreferences();
         updateMarketOptions();
+        updateTitle();
         reload();
 
         /* ---------- screenshot (方案 B：合成一张) ---------- */
@@ -411,6 +544,30 @@
             a.href = out.toDataURL("image/png");
             a.click();
         }
+
+        // ==================== KEYBOARD SHORTCUTS ====================
+        document.addEventListener('keydown', (e) => {
+            // Alt+E: focus on exchange selector
+            if (e.altKey && e.key === 'e') {
+                e.preventDefault();
+                exchangeSel.focus();
+            }
+            // Alt+S: focus on symbol selector
+            if (e.altKey && e.key === 's') {
+                e.preventDefault();
+                symbolSel.focus();
+            }
+            // Alt+T: focus on timeframe selector
+            if (e.altKey && e.key === 't') {
+                e.preventDefault();
+                tfSel.focus();
+            }
+            // Alt+P: take screenshot
+            if (e.altKey && e.key === 'p') {
+                e.preventDefault();
+                screenshotBoth();
+            }
+        });
 
         document.getElementById("shotAll").onclick = screenshotBoth;
     </script>
