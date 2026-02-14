@@ -1,49 +1,60 @@
-name: Trigger auto deployment for cvd
+name: Deploy cvd
 
-# When this action will be executed
 on:
-  # Automatically trigger it when detected changes in repo
   push:
-    branches: 
-      [ azure_deploy ]
-    paths:
-    - '**'
-    - '.github/workflows/cvd-AutoDeployTrigger-34cbaebc-50da-4e53-987a-7bf8655d7dd2.yml'
-
-  # Allow manual trigger 
-  workflow_dispatch:      
+    branches: [ "master" ]
+  workflow_dispatch:
 
 jobs:
-  build-and-deploy:
+  deploy:
     runs-on: ubuntu-latest
-    permissions: 
-      id-token: write #This is required for requesting the OIDC JWT Token
-      contents: read #Required when GH token is used to authenticate with private repo
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ACR_NAME: cvdacr2026
+      ACR_SERVER: cvdacr2026.azurecr.io
+      RG: cvd
+      APP: cvd
+      IMAGE_REPO: cvd
 
     steps:
-      - name: Checkout to the branch
-        uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-      - name: Azure Login
-        uses: azure/login@v2
+      - uses: azure/login@v2
         with:
           client-id: ${{ secrets.CVD_AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.CVD_AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.CVD_AZURE_SUBSCRIPTION_ID }}
 
-      - name: Build and push container image to registry
-        uses: azure/container-apps-deploy-action@v2
-        with:
-          appSourcePath: ${{ github.workspace }}
-          _dockerfilePathKey_: _dockerfilePath_
-          _targetLabelKey_: _targetLabel_
-          registryUrl: cvdacr2026.azurecr.io
-          registryUsername: ${{ secrets.CVD_REGISTRY_USERNAME }}
-          registryPassword: ${{ secrets.CVD_REGISTRY_PASSWORD }}
-          containerAppName: cvd
-          resourceGroup: cvd
-          imageToBuild: cvdacr2026.azurecr.io/cvd:${{ github.sha }}
-          _buildArgumentsKey_: |
-            _buildArgumentsValues_
+      - name: Login to ACR (AAD)
+        run: |
+          TOKEN=$(az acr login --name "$ACR_NAME" --expose-token --output tsv --query accessToken)
+          echo "$TOKEN" | docker login "$ACR_SERVER" -u 00000000-0000-0000-0000-000000000000 --password-stdin
 
+      - name: Build & push image
+        run: |
+          IMAGE="$ACR_SERVER/$IMAGE_REPO:${{ github.sha }}"
+          docker build -t "$IMAGE" -f ./Dockerfile .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
 
+      - name: Configure Container App registry auth
+        run: |
+          ACR_USER=$(az acr credential show -n "$ACR_NAME" -g "$RG" --query "username" -o tsv)
+          ACR_PASS=$(az acr credential show -n "$ACR_NAME" -g "$RG" --query "passwords[0].value" -o tsv)
+
+          az containerapp registry set \
+            --name "$APP" \
+            --resource-group "$RG" \
+            --server "$ACR_SERVER" \
+            --username "$ACR_USER" \
+            --password "$ACR_PASS"
+
+      - name: Update Container App image
+        run: |
+          az containerapp update \
+            --name "$APP" \
+            --resource-group "$RG" \
+            --image "$IMAGE" \
+            --set-env-vars DATABASE_URL="${{ secrets.DATABASE_URL }}"
