@@ -233,7 +233,7 @@ async fn load_history_page(
     limit: usize,
     before: Option<i64>,
 ) -> Result<Vec<Bar>> {
-    let limit = limit.min(4000).max(1);
+    let limit = limit.clamp(1, 4000);
 
     let rows: Vec<models::BarRow> = if let Some(before_ts) = before {
         sqlx::query_as(
