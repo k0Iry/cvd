@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 # 可选：把 db 和 static 放到容器里
 WORKDIR /app
-COPY --from=builder /usr/src/app/target/release/binance_cvd /usr/local/bin/binance_cvd
+COPY --from=builder /usr/src/app/target/release/cvd /usr/local/bin/cvd
 COPY static ./static
 
 EXPOSE 8000
@@ -18,4 +18,4 @@ EXPOSE 8000
 ENV SQLITE_URL="sqlite:/data/cvd.db"
 RUN mkdir -p /data
 
-CMD ["binance_cvd"]
+CMD ["cvd"]
