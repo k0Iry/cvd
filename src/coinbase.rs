@@ -91,8 +91,10 @@ pub async fn run_coinbase_engine(
                             Err(_) => continue,
                         };
 
-                        // side: "buy" (taker buy) => positive, "sell" (taker sell) => negative
-                        let signed_size = if m.side == "sell" { -size } else { size };
+                        // The side field indicates the maker order side. 
+                        // If the side is sell this indicates the maker was a sell order and the match is considered an up-tick.
+                        // A buy side match is a down-tick.
+                        let signed_size = if m.side == "sell" { size } else { -size };
                         let delta_usdt = signed_size * price;
 
                         let ts_ms = crate::parse_iso8601_to_ms(&m.time)?;
