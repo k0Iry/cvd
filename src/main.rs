@@ -1,8 +1,8 @@
-mod types;
-mod models;
 mod aggregator;
 mod binance;
 mod coinbase;
+mod models;
+mod types;
 
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket};
@@ -16,18 +16,25 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use rand::Rng;
 use serde::Deserialize;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::SqlitePool;
+use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::{collections::VecDeque, net::SocketAddr, sync::Arc};
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::connect_async;
 use tower_http::services::ServeDir;
 
-use types::{Exchange, Market, Symbol, Tf};
 use models::Bar;
+use types::{Exchange, Market, Symbol, Tf};
+
+// ==============================
+// Constants
+// ==============================
+const HISTORY_CAPACITY: usize = 4000;
+const BROADCAST_CHANNEL_CAPACITY: usize = 2048;
+const DB_CONNECTIONS: u32 = 8;
+const HTTP_ADDR: &str = "0.0.0.0:80";
 
 // ==============================
 // State / Shard
@@ -43,11 +50,11 @@ pub struct Shard {
 }
 
 fn mk_shard() -> Shard {
-    let (tx_1m, _) = broadcast::channel::<Bar>(2048);
-    let (tx_5m, _) = broadcast::channel::<Bar>(2048);
+    let (tx_1m, _) = broadcast::channel::<Bar>(BROADCAST_CHANNEL_CAPACITY);
+    let (tx_5m, _) = broadcast::channel::<Bar>(BROADCAST_CHANNEL_CAPACITY);
     Shard {
-        hist_1m: Arc::new(RwLock::new(VecDeque::with_capacity(4000))),
-        hist_5m: Arc::new(RwLock::new(VecDeque::with_capacity(4000))),
+        hist_1m: Arc::new(RwLock::new(VecDeque::with_capacity(HISTORY_CAPACITY))),
+        hist_5m: Arc::new(RwLock::new(VecDeque::with_capacity(HISTORY_CAPACITY))),
         tx_1m,
         tx_5m,
         cvd_closed_usdt: Arc::new(RwLock::new(0.0)),
@@ -56,11 +63,14 @@ fn mk_shard() -> Shard {
 
 pub struct AppState {
     pub shards: Arc<HashMap<(Exchange, Market, Symbol), Shard>>,
-    pub db: SqlitePool,
+    pub db: PgPool,
 }
 
 fn pick_shard(state: &AppState, exchange: Exchange, market: Market, symbol: Symbol) -> &Shard {
-    state.shards.get(&(exchange, market, symbol)).expect("shard missing")
+    state
+        .shards
+        .get(&(exchange, market, symbol))
+        .expect("shard missing")
 }
 
 // Helper: Get valid (market, symbol) pairs for a given exchange
@@ -69,8 +79,17 @@ fn get_market_symbol_pairs(exchange: Exchange) -> Vec<(Market, Symbol)> {
         Exchange::Coinbase => vec![(Market::Spot, Symbol::Btc), (Market::Spot, Symbol::Eth)],
         Exchange::Binance => {
             let markets = [Market::Spot, Market::Usdm, Market::Coinm];
-            let symbols = [Symbol::Btc, Symbol::Eth, Symbol::Sol, Symbol::Bnb, Symbol::Aave];
-            markets.iter().flat_map(|&m| symbols.iter().map(move |&s| (m, s))).collect()
+            let symbols = [
+                Symbol::Btc,
+                Symbol::Eth,
+                Symbol::Sol,
+                Symbol::Bnb,
+                Symbol::Aave,
+            ];
+            markets
+                .iter()
+                .flat_map(|&m| symbols.iter().map(move |&s| (m, s)))
+                .collect()
         }
     }
 }
@@ -90,64 +109,11 @@ struct Params {
 }
 
 // ==============================
-// DB + migration
+// DB init
 // ==============================
 
-async fn init_db(db: &SqlitePool) -> Result<()> {
-    sqlx::query("PRAGMA journal_mode=WAL;").execute(db).await?;
-    sqlx::query("PRAGMA synchronous=NORMAL;")
-        .execute(db)
-        .await?;
-
-    // Detect existing schema
-    let cols: Vec<(i64, String, String, i64, Option<String>, i64)> =
-        sqlx::query_as(r#"PRAGMA table_info(bars);"#)
-            .fetch_all(db)
-            .await
-            .unwrap_or_default();
-
-    let has_bars = !cols.is_empty();
-    let has_exchange_col = cols.iter().any(|c| c.1 == "exchange");
-
-    if has_bars && !has_exchange_col {
-        eprintln!("DB migrate: old bars table detected (no exchange). Migrating to bars_v2...");
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS bars_v2 (
-                exchange TEXT NOT NULL,
-                market TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                tf TEXT NOT NULL,
-                time INTEGER NOT NULL,
-                price_close REAL NOT NULL,
-                delta_usdt REAL NOT NULL,
-                cvd_usdt REAL NOT NULL,
-                trades INTEGER NOT NULL,
-                PRIMARY KEY (exchange, market, symbol, tf, time)
-            );
-            "#,
-        )
-        .execute(db)
-        .await?;
-
-        sqlx::query(
-            r#"
-            INSERT OR IGNORE INTO bars_v2 (exchange, market, symbol, tf, time, price_close, delta_usdt, cvd_usdt, trades)
-            SELECT 'binance', market, symbol, tf, time, price_close, delta_usdt, cvd_usdt, trades
-            FROM bars;
-            "#,
-        )
-        .execute(db)
-        .await?;
-
-        sqlx::query("DROP TABLE bars;").execute(db).await?;
-        sqlx::query("ALTER TABLE bars_v2 RENAME TO bars;")
-            .execute(db)
-            .await?;
-    }
-
-    // Ensure latest schema exists
+async fn init_db(db: &PgPool) -> Result<()> {
+    // Postgres schema (same logical schema as sqlite version)
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS bars (
@@ -155,11 +121,11 @@ async fn init_db(db: &SqlitePool) -> Result<()> {
             market TEXT NOT NULL,
             symbol TEXT NOT NULL,
             tf TEXT NOT NULL,
-            time INTEGER NOT NULL,
-            price_close REAL NOT NULL,
-            delta_usdt REAL NOT NULL,
-            cvd_usdt REAL NOT NULL,
-            trades INTEGER NOT NULL,
+            time BIGINT NOT NULL,
+            price_close DOUBLE PRECISION NOT NULL,
+            delta_usdt DOUBLE PRECISION NOT NULL,
+            cvd_usdt DOUBLE PRECISION NOT NULL,
+            trades BIGINT NOT NULL,
             PRIMARY KEY (exchange, market, symbol, tf, time)
         );
         "#,
@@ -180,7 +146,7 @@ async fn init_db(db: &SqlitePool) -> Result<()> {
 }
 
 async fn load_history(
-    db: &SqlitePool,
+    db: &PgPool,
     exchange: &str,
     market: &str,
     symbol: &str,
@@ -191,9 +157,9 @@ async fn load_history(
         r#"
         SELECT time, price_close, delta_usdt, cvd_usdt, trades
         FROM bars
-        WHERE exchange = ? AND market = ? AND symbol = ? AND tf = ?
+        WHERE exchange = $1 AND market = $2 AND symbol = $3 AND tf = $4
         ORDER BY time DESC
-        LIMIT ?
+        LIMIT $5
         "#,
     )
     .bind(exchange)
@@ -225,7 +191,7 @@ fn convert_rows_to_bars(rows: Vec<models::BarRow>) -> (Vec<Bar>, f64) {
 }
 
 async fn load_history_page(
-    db: &SqlitePool,
+    db: &PgPool,
     exchange: &str,
     symbol: &str,
     market: &str,
@@ -233,17 +199,17 @@ async fn load_history_page(
     limit: usize,
     before: Option<i64>,
 ) -> Result<Vec<Bar>> {
-    let limit = limit.clamp(1, 4000);
+    let limit = limit.clamp(1, HISTORY_CAPACITY);
 
     let rows: Vec<models::BarRow> = if let Some(before_ts) = before {
         sqlx::query_as(
             r#"
             SELECT time, price_close, delta_usdt, cvd_usdt, trades
             FROM bars
-            WHERE exchange = ? AND symbol = ? AND market = ? AND tf = ?
-              AND time < ?
+            WHERE exchange = $1 AND symbol = $2 AND market = $3 AND tf = $4
+              AND time < $5
             ORDER BY time DESC
-            LIMIT ?
+            LIMIT $6
             "#,
         )
         .bind(exchange)
@@ -259,9 +225,9 @@ async fn load_history_page(
             r#"
             SELECT time, price_close, delta_usdt, cvd_usdt, trades
             FROM bars
-            WHERE exchange = ? AND symbol = ? AND market = ? AND tf = ?
+            WHERE exchange = $1 AND symbol = $2 AND market = $3 AND tf = $4
             ORDER BY time DESC
-            LIMIT ?
+            LIMIT $5
             "#,
         )
         .bind(exchange)
@@ -277,12 +243,17 @@ async fn load_history_page(
     Ok(v)
 }
 
-async fn hydrate_shard(state: &AppState, exchange: Exchange, market: Market, symbol: Symbol) -> Result<()> {
+async fn hydrate_shard(
+    state: &AppState,
+    exchange: Exchange,
+    market: Market,
+    symbol: Symbol,
+) -> Result<()> {
     let e = exchange.as_str();
     let m = market.as_str();
     let s = symbol.as_str();
-    let (h1, last1) = load_history(&state.db, e, m, s, "1m", 4000).await?;
-    let (h5, _last5) = load_history(&state.db, e, m, s, "5m", 4000).await?;
+    let (h1, last1) = load_history(&state.db, e, m, s, "1m", HISTORY_CAPACITY).await?;
+    let (h5, _last5) = load_history(&state.db, e, m, s, "5m", HISTORY_CAPACITY).await?;
 
     let sh = pick_shard(state, exchange, market, symbol);
     *sh.hist_1m.write().await = h1;
@@ -298,12 +269,13 @@ async fn hydrate_shard(state: &AppState, exchange: Exchange, market: Market, sym
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let sqlite_url = std::env::var("SQLITE_URL").unwrap_or_else(|_| "sqlite:cvd.db".to_string());
-    let opts = SqliteConnectOptions::from_str(&sqlite_url)?.create_if_missing(true);
+    // Postgres URL from env
+    // Example:
+    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
-    let db = SqlitePoolOptions::new()
-        .max_connections(8)
-        .connect_with(opts)
+    let db = PgPoolOptions::new()
+        .max_connections(DB_CONNECTIONS)
+        .connect(&database_url)
         .await?;
 
     init_db(&db).await?;
@@ -346,7 +318,7 @@ async fn main() -> Result<()> {
         .nest_service("/", ServeDir::new("static"))
         .with_state(state);
 
-    let addr: SocketAddr = "0.0.0.0:80".parse().unwrap();
+    let addr: SocketAddr = HTTP_ADDR.parse().unwrap();
     println!("Open UI: http://{addr}/");
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
 
@@ -362,7 +334,7 @@ async fn history(State(state): State<Arc<AppState>>, Query(p): Query<Params>) ->
     let symbol = p.symbol.as_deref().unwrap_or("BTC");
     let market = p.market.as_deref().unwrap_or("spot");
     let tf = p.tf.as_deref().unwrap_or("1m");
-    let limit = p.limit.unwrap_or(800).min(4000);
+    let limit = p.limit.unwrap_or(800).min(HISTORY_CAPACITY);
     let before = p.before;
 
     match load_history_page(&state.db, exchange, symbol, market, tf, limit, before).await {
@@ -489,7 +461,12 @@ pub fn get_ws_url(exchange: Exchange, market: Market, symbol: Symbol) -> String 
     }
 }
 
-async fn run_engine_once(state: &AppState, exchange: Exchange, market: Market, symbol: Symbol) -> Result<()> {
+async fn run_engine_once(
+    state: &AppState,
+    exchange: Exchange,
+    market: Market,
+    symbol: Symbol,
+) -> Result<()> {
     let url = get_ws_url(exchange, market, symbol);
     eprintln!(
         "[{}:{}:{}] Connecting to: {}",
@@ -505,8 +482,12 @@ async fn run_engine_once(state: &AppState, exchange: Exchange, market: Market, s
     let sh = pick_shard(state, exchange, market, symbol);
 
     match exchange {
-        Exchange::Binance => binance::run_binance_engine(state, exchange, market, symbol, sh, write, read).await,
-        Exchange::Coinbase => coinbase::run_coinbase_engine(state, exchange, market, symbol, sh, write, read).await,
+        Exchange::Binance => {
+            binance::run_binance_engine(state, exchange, market, symbol, sh, write, read).await
+        }
+        Exchange::Coinbase => {
+            coinbase::run_coinbase_engine(state, exchange, market, symbol, sh, write, read).await
+        }
     }
 }
 
@@ -574,7 +555,14 @@ pub async fn flush_second(
     let _ = sh.tx_5m.send(live_bar_5m);
 }
 
-async fn push_publish(state: &AppState, exchange: Exchange, market: Market, symbol: Symbol, tf: Tf, bar: Bar) {
+async fn push_publish(
+    state: &AppState,
+    exchange: Exchange,
+    market: Market,
+    symbol: Symbol,
+    tf: Tf,
+    bar: Bar,
+) {
     let exchange_str = exchange.as_str();
     let tf_str = tf.as_str();
     let market_str = market.as_str();
@@ -583,7 +571,7 @@ async fn push_publish(state: &AppState, exchange: Exchange, market: Market, symb
     if let Err(e) = sqlx::query(
         r#"
         INSERT INTO bars (exchange, market, symbol, tf, time, price_close, delta_usdt, cvd_usdt, trades)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
         ON CONFLICT(exchange, market, symbol, tf, time) DO UPDATE SET
             price_close=excluded.price_close,
             delta_usdt=excluded.delta_usdt,
@@ -610,7 +598,7 @@ async fn push_publish(state: &AppState, exchange: Exchange, market: Market, symb
     }
 
     let sh = pick_shard(state, exchange, market, symbol);
-    let max = 4000usize;
+    let max = HISTORY_CAPACITY;
 
     match tf {
         Tf::M1 => {

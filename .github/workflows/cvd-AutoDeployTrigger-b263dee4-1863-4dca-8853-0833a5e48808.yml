@@ -56,4 +56,5 @@ jobs:
           az containerapp update \
             --name "$APP" \
             --resource-group "$RG" \
-            --image "$IMAGE"
+            --image "$IMAGE" \
+            --set-env-vars DATABASE_URL="${{ secrets.DATABASE_URL }}"
