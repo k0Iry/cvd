@@ -30,14 +30,6 @@ use types::{Exchange, Market, Symbol, Tf};
 use models::Bar;
 
 // ==============================
-// Constants
-// ==============================
-const HISTORY_CAPACITY: usize = 4000;
-const BROADCAST_CHANNEL_CAPACITY: usize = 2048;
-const DB_CONNECTIONS: u32 = 8;
-const HTTP_ADDR: &str = "0.0.0.0:8000";
-
-// ==============================
 // State / Shard
 // ==============================
 
@@ -51,11 +43,11 @@ pub struct Shard {
 }
 
 fn mk_shard() -> Shard {
-    let (tx_1m, _) = broadcast::channel::<Bar>(BROADCAST_CHANNEL_CAPACITY);
-    let (tx_5m, _) = broadcast::channel::<Bar>(BROADCAST_CHANNEL_CAPACITY);
+    let (tx_1m, _) = broadcast::channel::<Bar>(2048);
+    let (tx_5m, _) = broadcast::channel::<Bar>(2048);
     Shard {
-        hist_1m: Arc::new(RwLock::new(VecDeque::with_capacity(HISTORY_CAPACITY))),
-        hist_5m: Arc::new(RwLock::new(VecDeque::with_capacity(HISTORY_CAPACITY))),
+        hist_1m: Arc::new(RwLock::new(VecDeque::with_capacity(4000))),
+        hist_5m: Arc::new(RwLock::new(VecDeque::with_capacity(4000))),
         tx_1m,
         tx_5m,
         cvd_closed_usdt: Arc::new(RwLock::new(0.0)),
@@ -241,7 +233,7 @@ async fn load_history_page(
     limit: usize,
     before: Option<i64>,
 ) -> Result<Vec<Bar>> {
-    let limit = limit.min(HISTORY_CAPACITY).max(1);
+    let limit = limit.min(4000).max(1);
 
     let rows: Vec<models::BarRow> = if let Some(before_ts) = before {
         sqlx::query_as(
@@ -289,8 +281,8 @@ async fn hydrate_shard(state: &AppState, exchange: Exchange, market: Market, sym
     let e = exchange.as_str();
     let m = market.as_str();
     let s = symbol.as_str();
-    let (h1, last1) = load_history(&state.db, e, m, s, "1m", HISTORY_CAPACITY).await?;
-    let (h5, _last5) = load_history(&state.db, e, m, s, "5m", HISTORY_CAPACITY).await?;
+    let (h1, last1) = load_history(&state.db, e, m, s, "1m", 4000).await?;
+    let (h5, _last5) = load_history(&state.db, e, m, s, "5m", 4000).await?;
 
     let sh = pick_shard(state, exchange, market, symbol);
     *sh.hist_1m.write().await = h1;
@@ -310,7 +302,7 @@ async fn main() -> Result<()> {
     let opts = SqliteConnectOptions::from_str(&sqlite_url)?.create_if_missing(true);
 
     let db = SqlitePoolOptions::new()
-        .max_connections(DB_CONNECTIONS)
+        .max_connections(8)
         .connect_with(opts)
         .await?;
 
@@ -354,7 +346,7 @@ async fn main() -> Result<()> {
         .nest_service("/", ServeDir::new("static"))
         .with_state(state);
 
-    let addr: SocketAddr = HTTP_ADDR.parse().unwrap();
+    let addr: SocketAddr = "0.0.0.0:8000".parse().unwrap();
     println!("Open UI: http://{addr}/");
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
 
@@ -370,7 +362,7 @@ async fn history(State(state): State<Arc<AppState>>, Query(p): Query<Params>) ->
     let symbol = p.symbol.as_deref().unwrap_or("BTC");
     let market = p.market.as_deref().unwrap_or("spot");
     let tf = p.tf.as_deref().unwrap_or("1m");
-    let limit = p.limit.unwrap_or(800).min(HISTORY_CAPACITY);
+    let limit = p.limit.unwrap_or(800).min(4000);
     let before = p.before;
 
     match load_history_page(&state.db, exchange, symbol, market, tf, limit, before).await {
@@ -618,7 +610,7 @@ async fn push_publish(state: &AppState, exchange: Exchange, market: Market, symb
     }
 
     let sh = pick_shard(state, exchange, market, symbol);
-    let max = HISTORY_CAPACITY;
+    let max = 4000usize;
 
     match tf {
         Tf::M1 => {

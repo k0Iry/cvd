@@ -41,7 +41,7 @@ pub async fn run_coinbase_engine(
     let mut a1 = BucketAgg::new();
     let mut a5 = BucketAgg::new();
 
-    let mut ping = tokio::time::interval(Duration::from_secs(crate::types::COINBASE_PING_INTERVAL_SECS));
+    let mut ping = tokio::time::interval(Duration::from_secs(20));
     loop {
         tokio::select! {
             _ = ping.tick() => {
@@ -72,6 +72,7 @@ pub async fn run_coinbase_engine(
                         if m.msg_type != "match" {
                             continue;
                         }
+
                         let expected_product = match symbol {
                             Symbol::Btc => "BTC-USD",
                             Symbol::Eth => "ETH-USD",
@@ -81,15 +82,24 @@ pub async fn run_coinbase_engine(
                             continue;
                         }
 
+                        let price: f64 = match m.price.parse() {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        let size: f64 = match m.size.parse() {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+
                         // side: "buy" (taker buy) => positive, "sell" (taker sell) => negative
-                        let signed_size = if m.side == "sell" { m.size } else { -m.size };
-                        let delta_usdt = signed_size * m.price;
+                        let signed_size = if m.side == "sell" { size } else { -size };
+                        let delta_usdt = signed_size * price;
 
                         let ts_ms = crate::parse_iso8601_to_ms(&m.time)?;
                         let this_sec = ts_ms / 1000;
 
                         match sec.cur_sec {
-                            None => sec.reset_to(this_sec, m.price, delta_usdt),
+                            None => sec.reset_to(this_sec, price, delta_usdt),
                             Some(s) if s != this_sec => {
                                 let sec_ended = s;
                                 let sec_last_price = sec.last_price;
@@ -113,9 +123,9 @@ pub async fn run_coinbase_engine(
 
                                 *sh.cvd_closed_usdt.write().await = cvd_closed_usdt;
 
-                                sec.reset_to(this_sec, m.price, delta_usdt);
+                                sec.reset_to(this_sec, price, delta_usdt);
                             }
-                            _ => sec.add(m.price, delta_usdt),
+                            _ => sec.add(price, delta_usdt),
                         }
                     }
                     Message::Close(_) => break,

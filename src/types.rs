@@ -2,8 +2,6 @@
 // Types: Exchange / Market / Symbol / Tf
 // ==============================
 
-pub const COINBASE_PING_INTERVAL_SECS: u64 = 20;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum Exchange {
     Binance,
