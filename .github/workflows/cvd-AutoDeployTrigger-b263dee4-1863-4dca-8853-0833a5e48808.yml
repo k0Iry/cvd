@@ -1,4 +1,4 @@
-name: Deploy cvd to Azure Container Apps
+name: Deploy cvd
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-and-deploy:
+  deploy:
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -21,13 +21,21 @@ jobs:
           tenant-id: ${{ secrets.CVD_AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.CVD_AZURE_SUBSCRIPTION_ID }}
 
-      - uses: azure/container-apps-deploy-action@v2
-        with:
-          appSourcePath: ${{ github.workspace }}
-          dockerfilePath: ./Dockerfile
-          registryUrl: ${{ secrets.CVD_REGISTRY_SERVER }}
-          registryUsername: ${{ secrets.CVD_REGISTRY_USERNAME }}
-          registryPassword: ${{ secrets.CVD_REGISTRY_PASSWORD }}
-          containerAppName: cvd
-          resourceGroup: cvd
-          imageToBuild: ${{ secrets.CVD_REGISTRY_SERVER }}/cvd:${{ github.sha }}
+      - name: Docker login to ACR
+        run: |
+          echo "${{ secrets.CVD_REGISTRY_PASSWORD }}" | docker login ${{ secrets.CVD_REGISTRY_SERVER }} \
+            -u "${{ secrets.CVD_REGISTRY_USERNAME }}" --password-stdin
+
+      - name: Build & push image
+        run: |
+          IMAGE="${{ secrets.CVD_REGISTRY_SERVER }}/cvd:${{ github.sha }}"
+          docker build -t "$IMAGE" -f ./Dockerfile .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+
+      - name: Update Container App image
+        run: |
+          az containerapp update \
+            --name cvd \
+            --resource-group cvd \
+            --image "$IMAGE"
