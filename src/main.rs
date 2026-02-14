@@ -346,7 +346,7 @@ async fn main() -> Result<()> {
         .nest_service("/", ServeDir::new("static"))
         .with_state(state);
 
-    let addr: SocketAddr = "0.0.0.0:8000".parse().unwrap();
+    let addr: SocketAddr = "0.0.0.0:80".parse().unwrap();
     println!("Open UI: http://{addr}/");
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
 

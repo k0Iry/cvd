@@ -13,7 +13,7 @@ WORKDIR /app
 COPY --from=builder /usr/src/app/target/release/cvd /usr/local/bin/cvd
 COPY static ./static
 
-EXPOSE 8000
+EXPOSE 80
 
 ENV SQLITE_URL="sqlite:/data/cvd.db"
 RUN mkdir -p /data
