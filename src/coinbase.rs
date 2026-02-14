@@ -9,7 +9,6 @@ use crate::aggregator::{BucketAgg, SecAgg};
 use crate::AppState;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::MaybeTlsStream;
-use serde_json;
 
 pub async fn run_coinbase_engine(
     state: &AppState,
@@ -21,8 +20,8 @@ pub async fn run_coinbase_engine(
     mut read: futures::stream::SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>,
 ) -> Result<()> {
     let product_ids = match symbol {
-        Symbol::BTC => vec!["BTC-USD"],
-        Symbol::ETH => vec!["ETH-USD"],
+        Symbol::Btc => vec!["BTC-USD"],
+        Symbol::Eth => vec!["ETH-USD"],
         _ => return Err(anyhow!("Coinbase only supports BTC and ETH")),
     };
 
@@ -75,8 +74,8 @@ pub async fn run_coinbase_engine(
                         }
 
                         let expected_product = match symbol {
-                            Symbol::BTC => "BTC-USD",
-                            Symbol::ETH => "ETH-USD",
+                            Symbol::Btc => "BTC-USD",
+                            Symbol::Eth => "ETH-USD",
                             _ => unreachable!(),
                         };
                         if m.product_id != expected_product {

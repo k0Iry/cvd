@@ -307,11 +307,11 @@ async fn main() -> Result<()> {
     let exchanges = [Exchange::Binance, Exchange::Coinbase];
     let markets = [Market::Spot, Market::Usdm, Market::Coinm];
     let symbols = [
-        Symbol::BTC,
-        Symbol::ETH,
-        Symbol::SOL,
-        Symbol::BNB,
-        Symbol::AAVE,
+        Symbol::Btc,
+        Symbol::Eth,
+        Symbol::Sol,
+        Symbol::Bnb,
+        Symbol::Aave,
     ];
 
     for &ex in &exchanges {
@@ -320,7 +320,7 @@ async fn main() -> Result<()> {
                 continue;
             }
             let syms = if ex == Exchange::Coinbase {
-                &[Symbol::BTC, Symbol::ETH]
+                &[Symbol::Btc, Symbol::Eth]
             } else {
                 &symbols[..]
             };
@@ -343,7 +343,7 @@ async fn main() -> Result<()> {
                 continue;
             }
             let syms = if ex == Exchange::Coinbase {
-                &[Symbol::BTC, Symbol::ETH]
+                &[Symbol::Btc, Symbol::Eth]
             } else {
                 &symbols[..]
             };
@@ -360,7 +360,7 @@ async fn main() -> Result<()> {
                 continue;
             }
             let syms = if ex == Exchange::Coinbase {
-                &[Symbol::BTC, Symbol::ETH]
+                &[Symbol::Btc, Symbol::Eth]
             } else {
                 &symbols[..]
             };

@@ -47,59 +47,59 @@ impl Market {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum Symbol {
-    BTC,
-    ETH,
-    SOL,
-    BNB,
-    AAVE,
+    Btc,
+    Eth,
+    Sol,
+    Bnb,
+    Aave,
 }
 impl Symbol {
     pub fn from_str(s: &str) -> Self {
         match s.to_uppercase().as_str() {
-            "ETH" => Self::ETH,
-            "SOL" => Self::SOL,
-            "BNB" => Self::BNB,
-            "AAVE" => Self::AAVE,
-            _ => Self::BTC,
+            "ETH" => Self::Eth,
+            "SOL" => Self::Sol,
+            "BNB" => Self::Bnb,
+            "AAVE" => Self::Aave,
+            _ => Self::Btc,
         }
     }
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::BTC => "BTC",
-            Self::ETH => "ETH",
-            Self::SOL => "SOL",
-            Self::BNB => "BNB",
-            Self::AAVE => "AAVE",
+            Self::Btc => "BTC",
+            Self::Eth => "ETH",
+            Self::Sol => "SOL",
+            Self::Bnb => "BNB",
+            Self::Aave => "AAVE",
         }
     }
 
     // Spot / USDM use <asset>USDT
     pub fn spot_usdm_stream(self) -> &'static str {
         match self {
-            Self::BTC => "btcusdt",
-            Self::ETH => "ethusdt",
-            Self::SOL => "solusdt",
-            Self::BNB => "bnbusdt",
-            Self::AAVE => "aaveusdt",
+            Self::Btc => "btcusdt",
+            Self::Eth => "ethusdt",
+            Self::Sol => "solusdt",
+            Self::Bnb => "bnbusdt",
+            Self::Aave => "aaveusdt",
         }
     }
 
     // COINM uses <asset>USD_PERP
     pub fn coinm_stream(self) -> &'static str {
         match self {
-            Self::BTC => "btcusd_perp",
-            Self::ETH => "ethusd_perp",
-            Self::SOL => "solusd_perp",
-            Self::BNB => "bnbusd_perp",
-            Self::AAVE => "aaveusd_perp",
+            Self::Btc => "btcusd_perp",
+            Self::Eth => "ethusd_perp",
+            Self::Sol => "solusd_perp",
+            Self::Bnb => "bnbusd_perp",
+            Self::Aave => "aaveusd_perp",
         }
     }
 
     // Coinbase product_id for trading pairs
     pub fn coinbase_product_id(self) -> &'static str {
         match self {
-            Self::BTC => "BTC-USD",
-            Self::ETH => "ETH-USD",
+            Self::Btc => "BTC-USD",
+            Self::Eth => "ETH-USD",
             _ => "BTC-USD", // Only BTC and ETH for Coinbase
         }
     }
