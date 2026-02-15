@@ -14,27 +14,6 @@ pub struct AggTrade {
     pub is_buyer_maker: bool,
 }
 
-// Coinbase "match" message schema
-#[derive(Debug, Deserialize)]
-pub struct CoinbaseMatch {
-    #[serde(rename = "type")]
-    pub msg_type: String, // "match"
-    pub time: String, // ISO8601
-    pub product_id: String,
-    pub size: String,
-    pub price: String,
-    pub side: String, // maker side: "buy" or "sell"
-}
-
-// Coinbase subscribe request
-#[derive(Debug, Serialize)]
-pub struct CoinbaseSubscribe<'a> {
-    #[serde(rename = "type")]
-    pub msg_type: &'a str, // "subscribe"
-    pub product_ids: Vec<&'a str>,
-    pub channels: Vec<&'a str>, // ["matches"]
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct Bar {
     pub time: i64, // unix seconds (lightweight-charts)

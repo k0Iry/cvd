@@ -2,13 +2,33 @@ use anyhow::{anyhow, Result};
 use futures::{StreamExt, SinkExt};
 use tokio::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
-
-use crate::models::{CoinbaseMatch, CoinbaseSubscribe};
 use crate::types::{Exchange, Market, Symbol};
 use crate::aggregator::{BucketAgg, SecAgg};
 use crate::AppState;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::MaybeTlsStream;
+use serde::{Deserialize, Serialize};
+
+// Coinbase "match" message schema
+#[derive(Debug, Deserialize)]
+struct CoinbaseMatch {
+    #[serde(rename = "type")]
+    msg_type: String, // "match"
+    time: String, // ISO8601
+    product_id: String,
+    size: String,
+    price: String,
+    side: String, // maker side: "buy" or "sell"
+}
+
+// Coinbase subscribe request
+#[derive(Debug, Serialize)]
+struct CoinbaseSubscribe<'a> {
+    #[serde(rename = "type")]
+    msg_type: &'a str, // "subscribe"
+    product_ids: Vec<&'a str>,
+    channels: Vec<&'a str>, // ["matches"]
+}
 
 pub async fn run_coinbase_engine(
     state: &AppState,
