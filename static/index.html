@@ -60,13 +60,13 @@
     <div class="bar">
         <div class="pill">Source: local axum</div>
 
-        <div>Exchange:</div>
+        Exchange:
         <select id="exchange">
             <option value="binance">Binance</option>
             <option value="coinbase">Coinbase</option>
         </select>
 
-        <div>Symbol:</div>
+        Symbol:
         <select id="symbol">
             <option>BTC</option>
             <option>ETH</option>
@@ -75,20 +75,19 @@
             <option>AAVE</option>
         </select>
 
-        <div>Market:</div>
+        Market:
         <select id="market">
             <option>spot</option>
             <option>usdm</option>
             <option>coinm</option>
         </select>
 
-        <div>TF:</div>
+        TF:
         <select id="tf">
             <option>1m</option>
             <option>5m</option>
         </select>
 
-        <button id="shotAll">📸 Screenshot</button>
         <div id="status" class="pill">loading…</div>
     </div>
 
@@ -104,7 +103,8 @@
         const CONFIG = {
             HISTORY_PAGE_SIZE: 800,
             WINDOW_SIZE: 20000,
-            EDGE_TRIGGER: 30
+            EDGE_TRIGGER: 30,
+            FETCH_COOLDOWN: 300
         }
 
         const exchangeSel = document.getElementById("exchange")
@@ -113,27 +113,26 @@
         const tfSel = document.getElementById("tf")
         const statusEl = document.getElementById("status")
 
-        const priceChart = LightweightCharts.createChart(document.getElementById("price"), {
-            layout: { background: { color: "#111" }, textColor: "#ddd" },
-            grid: { vertLines: { color: "#222" }, horzLines: { color: "#222" } },
-            timeScale: { borderColor: "#333" },
-            rightPriceScale: { borderColor: "#333" }
-        })
+        function mkChart(el) {
+            return LightweightCharts.createChart(el, {
+                layout: { background: { color: "#111" }, textColor: "#ddd" },
+                grid: { vertLines: { color: "#222" }, horzLines: { color: "#222" } },
+                timeScale: { borderColor: "#333" },
+                rightPriceScale: { borderColor: "#333" }
+            })
+        }
 
-        const cvdChart = LightweightCharts.createChart(document.getElementById("cvd"), {
-            layout: { background: { color: "#111" }, textColor: "#ddd" },
-            grid: { vertLines: { color: "#222" }, horzLines: { color: "#222" } },
-            timeScale: { borderColor: "#333" },
-            rightPriceScale: { borderColor: "#333" }
-        })
+        const priceChart = mkChart(document.getElementById("price"))
+        const cvdChart = mkChart(document.getElementById("cvd"))
 
         const priceSeries = priceChart.addLineSeries({ color: "#f2c94c" })
         const cvdSeries = cvdChart.addLineSeries({ color: "#56ccf2" })
 
         let programmaticRangeChange = false
         let syncing = false
-        let lastAfterFetchAt = 0
         let lastBeforeFetchAt = 0
+        let lastAfterFetchAt = 0
+        let ws = null
 
         function sync(a, b) {
             a.timeScale().subscribeVisibleLogicalRangeChange(r => {
@@ -144,7 +143,6 @@
                 syncing = false
             })
         }
-
         sync(priceChart, cvdChart)
         sync(cvdChart, priceChart)
 
@@ -177,18 +175,16 @@
             const start = bars.length - CONFIG.WINDOW_SIZE
             const sliced = bars.slice(start)
             let newRange = oldRange
-            if (oldRange) {
-                newRange = { from: oldRange.from - start, to: oldRange.to - start }
-            }
+            if (oldRange) newRange = { from: oldRange.from - start, to: oldRange.to - start }
             return { bars: sliced, newRange }
         }
 
-        async function fetchHistory(exchange, symbol, market, tf, limit, before = null, after = null) {
+        async function fetchHistory(limit, before = null, after = null) {
             const u = new URL("/history", location.origin)
-            u.searchParams.set("exchange", exchange)
-            u.searchParams.set("symbol", symbol)
-            u.searchParams.set("market", market)
-            u.searchParams.set("tf", tf)
+            u.searchParams.set("exchange", exchangeSel.value)
+            u.searchParams.set("symbol", symbolSel.value)
+            u.searchParams.set("market", marketSel.value)
+            u.searchParams.set("tf", tfSel.value)
             u.searchParams.set("limit", limit)
             if (before != null) u.searchParams.set("before", before)
             if (after != null) u.searchParams.set("after", after)
@@ -197,50 +193,50 @@
         }
 
         async function loadInitial() {
-            const bars = await fetchHistory(exchangeSel.value, symbolSel.value, marketSel.value, tfSel.value, CONFIG.HISTORY_PAGE_SIZE)
+            statusEl.textContent = "loading…"
+            page.reachedStart = false
+            page.reachedEnd = false
+            const bars = await fetchHistory(CONFIG.HISTORY_PAGE_SIZE)
             setBars(bars || [])
+            statusEl.textContent = "live"
         }
 
         async function loadMoreBefore() {
             if (page.loadingOlder || page.reachedStart) return
             if (!page.oldestTime) return
-
             const now = Date.now()
-            if (now - lastBeforeFetchAt < 300) return
+            if (now - lastBeforeFetchAt < CONFIG.FETCH_COOLDOWN) return
             lastBeforeFetchAt = now
 
             page.loadingOlder = true
             const oldRange = priceChart.timeScale().getVisibleLogicalRange()
 
             try {
-                const older = await fetchHistory(exchangeSel.value, symbolSel.value, marketSel.value, tfSel.value, CONFIG.HISTORY_PAGE_SIZE, page.oldestTime, null)
+                const older = await fetchHistory(CONFIG.HISTORY_PAGE_SIZE, page.oldestTime, null)
                 if (!older.length) { page.reachedStart = true; return }
                 const merged = [...older.filter(b => b.time < page.oldestTime), ...page.bars]
                 const trimmed = trimToWindow(merged, oldRange)
                 setBars(trimmed.bars, trimmed.newRange)
-            }
-            finally { page.loadingOlder = false }
+            } finally { page.loadingOlder = false }
         }
 
         async function loadMoreAfter() {
             if (page.loadingNewer || page.reachedEnd) return
             if (!page.newestTime) return
-
             const now = Date.now()
-            if (now - lastAfterFetchAt < 300) return
+            if (now - lastAfterFetchAt < CONFIG.FETCH_COOLDOWN) return
             lastAfterFetchAt = now
 
             page.loadingNewer = true
             const oldRange = priceChart.timeScale().getVisibleLogicalRange()
 
             try {
-                const newer = await fetchHistory(exchangeSel.value, symbolSel.value, marketSel.value, tfSel.value, CONFIG.HISTORY_PAGE_SIZE, null, page.newestTime)
+                const newer = await fetchHistory(CONFIG.HISTORY_PAGE_SIZE, null, page.newestTime)
                 if (!newer.length) { page.reachedEnd = true; return }
                 const merged = [...page.bars, ...newer.filter(b => b.time > page.newestTime)]
                 const trimmed = trimToWindow(merged, oldRange)
                 setBars(trimmed.bars, trimmed.newRange)
-            }
-            finally { page.loadingNewer = false }
+            } finally { page.loadingNewer = false }
         }
 
         priceChart.timeScale().subscribeVisibleLogicalRangeChange(r => {
@@ -256,7 +252,56 @@
             if (rightGap <= CONFIG.EDGE_TRIGGER) loadMoreAfter()
         })
 
-        loadInitial()
+        function connectWs() {
+            if (ws) ws.close()
+            const proto = location.protocol === "https:" ? "wss" : "ws"
+            ws = new WebSocket(`${proto}://${location.host}/ws?exchange=${exchangeSel.value}&symbol=${symbolSel.value}&market=${marketSel.value}&tf=${tfSel.value}`)
+
+            ws.onopen = () => statusEl.textContent = "live"
+
+            ws.onmessage = ev => {
+                const b = JSON.parse(ev.data)
+                if (!b.time) return
+
+                const last = page.bars[page.bars.length - 1]
+
+                if (last && last.time === b.time) {
+                    page.bars[page.bars.length - 1] = b
+                } else if (!last || b.time > last.time) {
+                    page.bars.push(b)
+                }
+
+                if (page.bars.length > CONFIG.WINDOW_SIZE) {
+                    const r = priceChart.timeScale().getVisibleLogicalRange()
+                    const trimmed = trimToWindow(page.bars, r)
+                    setBars(trimmed.bars, trimmed.newRange)
+                } else {
+                    priceSeries.update({ time: b.time, value: b.price_close })
+                    cvdSeries.update({ time: b.time, value: b.cvd_usdt })
+                }
+
+                page.newestTime = b.time
+            }
+
+            ws.onclose = () => setTimeout(connectWs, 3000)
+        }
+
+        function reload() {
+            page.bars = []
+            page.oldestTime = null
+            page.newestTime = null
+            lastAfterFetchAt = 0
+            lastBeforeFetchAt = 0
+            loadInitial()
+            connectWs()
+        }
+
+        exchangeSel.onchange = reload
+        symbolSel.onchange = reload
+        marketSel.onchange = reload
+        tfSel.onchange = reload
+
+        reload()
 
     </script>
 </body>
