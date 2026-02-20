@@ -130,7 +130,19 @@
         const cvdChart = mkChart(document.getElementById("cvd"))
 
         const priceSeries = priceChart.addLineSeries({ color: "#f2c94c" })
-        const cvdSeries = cvdChart.addLineSeries({ color: "#56ccf2" })
+        const cvdSeries = cvdChart.addLineSeries({
+            color: "#56ccf2",
+            priceFormat: {
+                type: "custom",
+                formatter: (p) => {
+                    const a = Math.abs(p)
+                    if (a >= 1e9) return (p / 1e9).toFixed(2) + "B"
+                    if (a >= 1e6) return (p / 1e6).toFixed(2) + "M"
+                    if (a >= 1e3) return (p / 1e3).toFixed(2) + "K"
+                    return p.toFixed(0)
+                }
+            }
+        })
 
         let programmaticRangeChange = false
         let syncing = false
