@@ -265,6 +265,30 @@
             lastKey: "",
         };
 
+        // ======== AUTO-FOLLOW (no button) ========
+        let isFollowing = true;           // start in follow mode
+        let programmaticScroll = false;   // prevent feedback loop
+        const FOLLOW_RIGHT_BARS = 5;      // "how close to right edge counts as live"
+
+        // 判断当前视窗是否已经贴近最右侧
+        function isNearRightEdge(chart) {
+            const r = chart.timeScale().getVisibleLogicalRange();
+            if (!r || !page.bars.length) return true;
+
+            // logical index roughly maps to data index (0..len-1)
+            const rightMostIdx = page.bars.length - 1;
+            return (rightMostIdx - r.to) <= FOLLOW_RIGHT_BARS;
+        }
+
+        // 只要用户把图拖回右边，就自动恢复 follow
+        priceChart.timeScale().subscribeVisibleLogicalRangeChange((r) => {
+            if (!r || programmaticScroll) return;
+
+            // 用户在操作导致的 range change：判断是否回到了右边
+            const nearRight = isNearRightEdge(priceChart);
+            isFollowing = nearRight;
+        });
+
         function setBars(bars, keepRange = null) {
             page.bars = bars;
             page.oldestTime = bars.length ? bars[0].time : null;
@@ -279,10 +303,19 @@
 
         function mergePrepend(currentBars, olderBars) {
             if (!olderBars || olderBars.length === 0) return currentBars;
+
             const curFirst = currentBars.length ? currentBars[0].time : null;
-            const filteredOlder = (curFirst == null) ? olderBars : olderBars.filter(b => b.time < curFirst);
+            const filteredOlder = (curFirst == null)
+                ? olderBars
+                : olderBars.filter(b => b.time < curFirst);
+
             const merged = [...filteredOlder, ...currentBars];
-            if (merged.length > CONFIG.MAX_CACHED_BARS) return merged.slice(merged.length - CONFIG.MAX_CACHED_BARS);
+
+            // 只有在实时模式下才限制容量
+            if (isFollowing && merged.length > CONFIG.MAX_CACHED_BARS) {
+                return merged.slice(merged.length - CONFIG.MAX_CACHED_BARS);
+            }
+
             return merged;
         }
 
@@ -315,6 +348,9 @@
 
             const bars = await fetchHistory(exchange, symbol, market, tf, CONFIG.HISTORY_PAGE_SIZE, null);
             setBars(Array.isArray(bars) ? bars : []);
+
+            isFollowing = true;
+
             priceChart.timeScale().scrollToRealTime();
             statusEl.textContent = "live";
         }
@@ -417,13 +453,23 @@
                     bars[bars.length - 1] = b; // Update existing
                 } else if (!last || b.time > last.time) {
                     bars.push(b); // Append new
-                    if (bars.length > CONFIG.MAX_CACHED_BARS) bars.shift();
+                    if (isFollowing && bars.length > CONFIG.MAX_CACHED_BARS) bars.shift();
                 }
 
                 if (typeof b.price_close === "number") priceSeries.update({ time: b.time, value: b.price_close });
                 if (typeof b.cvd_usdt === "number") cvdSeries.update({ time: b.time, value: b.cvd_usdt });
 
                 page.oldestTime = bars.length ? bars[0].time : null;
+
+                // 如果处于 follow 模式，让图自动贴住最新
+                if (isFollowing) {
+                    programmaticScroll = true;
+                    // 用 requestAnimationFrame 避免 setData/update 后立即滚动导致抖动
+                    requestAnimationFrame(() => {
+                        priceChart.timeScale().scrollToRealTime();
+                        programmaticScroll = false;
+                    });
+                }
             };
 
             ws.onerror = (err) => {
