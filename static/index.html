@@ -117,7 +117,11 @@
             return LightweightCharts.createChart(el, {
                 layout: { background: { color: "#111" }, textColor: "#ddd" },
                 grid: { vertLines: { color: "#222" }, horzLines: { color: "#222" } },
-                timeScale: { borderColor: "#333" },
+                timeScale: {
+                    borderColor: "#333",
+                    timeVisible: true,      // ✅ 显示分钟
+                    secondsVisible: false   // ✅ 不显示秒
+                },
                 rightPriceScale: { borderColor: "#333" }
             })
         }
