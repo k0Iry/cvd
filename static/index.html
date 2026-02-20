@@ -4,16 +4,14 @@
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
-    <meta http-equiv="Pragma" content="no-cache" />
-    <meta http-equiv="Expires" content="0" />
     <title>CVD</title>
+
     <style>
         body {
             margin: 0;
             background: #111;
             color: #ddd;
-            font-family: sans-serif;
+            font-family: sans-serif
         }
 
         .bar {
@@ -22,22 +20,22 @@
             gap: 10px;
             align-items: center;
             border-bottom: 1px solid #222;
-            flex-wrap: wrap;
+            flex-wrap: wrap
         }
 
         #wrap {
             display: flex;
             flex-direction: column;
-            height: calc(100vh - 46px);
+            height: calc(100vh - 46px)
         }
 
         #price {
-            flex: 2;
+            flex: 2
         }
 
         #cvd {
             flex: 1;
-            border-top: 1px solid #333;
+            border-top: 1px solid #333
         }
 
         select {
@@ -45,25 +43,26 @@
             color: #ddd;
             border: 1px solid #444;
             padding: 4px 8px;
-            border-radius: 6px;
+            border-radius: 6px
         }
 
         .pill {
             font-size: 12px;
             padding: 2px 8px;
             border: 1px solid #333;
-            border-radius: 999px;
+            border-radius: 999px
         }
     </style>
 </head>
 
 <body>
+
     <div class="bar">
         <div class="pill">Source: local axum</div>
 
         <div>Exchange:</div>
         <select id="exchange">
-            <option value="binance" selected>Binance</option>
+            <option value="binance">Binance</option>
             <option value="coinbase">Coinbase</option>
         </select>
 
@@ -89,17 +88,7 @@
             <option>5m</option>
         </select>
 
-        <div>Timezone:</div>
-        <select id="tz">
-            <option value="local">Local</option>
-            <option value="UTC">UTC</option>
-            <option value="Asia/Shanghai">Beijing</option>
-            <option value="America/New_York">New York</option>
-            <option value="Europe/London">London</option>
-        </select>
-
         <button id="shotAll">📸 Screenshot</button>
-
         <div id="status" class="pill">loading…</div>
     </div>
 
@@ -109,513 +98,166 @@
     </div>
 
     <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+
     <script>
-        // ==================== CONFIG ====================
+
         const CONFIG = {
             HISTORY_PAGE_SIZE: 800,
-            MAX_CACHED_BARS: 4000,
-            LOAD_TRIGGER: 30, // bars from left edge
-            WS_RECONNECT_DELAY: 3000, // ms
-            WS_MAX_RECONNECT_ATTEMPTS: 10,
-            FETCH_TIMEOUT: 10000, // ms
-            STORAGE_KEY_PREFIX: 'cvd_',
-        };
-
-        // ==================== EXCHANGE/MARKET CONFIG ====================
-        const EXCHANGE_CONFIG = {
-            binance: {
-                markets: ['spot', 'usdm', 'coinm'],
-                symbols: ['BTC', 'ETH', 'SOL', 'BNB', 'AAVE'],
-            },
-            coinbase: {
-                markets: ['spot'],
-                symbols: ['BTC', 'ETH'],
-            },
-        };
-
-        // ==================== DOM ELEMENTS ====================
-        const exchangeSel = document.getElementById("exchange");
-        const symbolSel = document.getElementById("symbol");
-        const marketSel = document.getElementById("market");
-        const tfSel = document.getElementById("tf");
-        const tzSel = document.getElementById("tz");
-        const statusEl = document.getElementById("status");
-
-        const API = "";
-
-        // Update market/symbol options based on selected exchange
-        function updateMarketOptions() {
-            const exchange = exchangeSel.value;
-            const config = EXCHANGE_CONFIG[exchange];
-            if (!config) return;
-
-            const currentMarket = marketSel.value;
-            const currentSymbol = symbolSel.value;
-
-            // Update markets
-            marketSel.innerHTML = config.markets.map(m => `<option>${m}</option>`).join('');
-            if (!currentMarket || !config.markets.includes(currentMarket)) {
-                marketSel.value = config.markets[0];
-            } else {
-                marketSel.value = currentMarket;
-            }
-
-            // Update symbols
-            symbolSel.innerHTML = config.symbols.map(s => `<option>${s}</option>`).join('');
-            if (!currentSymbol || !config.symbols.includes(currentSymbol)) {
-                symbolSel.value = config.symbols[0];
-            } else {
-                symbolSel.value = currentSymbol;
-            }
+            WINDOW_SIZE: 20000,
+            EDGE_TRIGGER: 30
         }
 
-        exchangeSel.onchange = () => {
-            updateMarketOptions();
-            reload();
-        };
+        const exchangeSel = document.getElementById("exchange")
+        const symbolSel = document.getElementById("symbol")
+        const marketSel = document.getElementById("market")
+        const tfSel = document.getElementById("tf")
+        const statusEl = document.getElementById("status")
 
-        function mkChart(el) {
-            return LightweightCharts.createChart(el, {
-                layout: { background: { color: "#111" }, textColor: "#ddd" },
-                grid: { vertLines: { color: "#222" }, horzLines: { color: "#222" } },
-                timeScale: {
-                    borderColor: "#333",
-                    rightOffset: 2,
-                    timeVisible: true,
-                    secondsVisible: false,
-                },
-                rightPriceScale: { borderColor: "#333" },
-                crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-                width: el.clientWidth, height: el.clientHeight
-            });
-        }
+        const priceChart = LightweightCharts.createChart(document.getElementById("price"), {
+            layout: { background: { color: "#111" }, textColor: "#ddd" },
+            grid: { vertLines: { color: "#222" }, horzLines: { color: "#222" } },
+            timeScale: { borderColor: "#333" },
+            rightPriceScale: { borderColor: "#333" }
+        })
 
-        // ==================== CHARTS ====================
-        const priceEl = document.getElementById("price");
-        const cvdEl = document.getElementById("cvd");
-        const priceChart = mkChart(priceEl);
-        const cvdChart = mkChart(cvdEl);
+        const cvdChart = LightweightCharts.createChart(document.getElementById("cvd"), {
+            layout: { background: { color: "#111" }, textColor: "#ddd" },
+            grid: { vertLines: { color: "#222" }, horzLines: { color: "#222" } },
+            timeScale: { borderColor: "#333" },
+            rightPriceScale: { borderColor: "#333" }
+        })
 
-        const priceSeries = priceChart.addLineSeries({
-            color: "#f2c94c",
-            lineWidth: 2,
-            priceLineVisible: true,
-        });
-        const cvdSeries = cvdChart.addLineSeries({
-            color: "#56ccf2",
-            lineWidth: 2,
-            priceFormat: {
-                type: "custom",
-                formatter: (p) => {
-                    const a = Math.abs(p);
-                    if (a >= 1e9) return (p / 1e9).toFixed(2) + "B";
-                    if (a >= 1e6) return (p / 1e6).toFixed(2) + "M";
-                    if (a >= 1e3) return (p / 1e3).toFixed(2) + "K";
-                    return p.toFixed(0);
-                }
-            }
-        });
+        const priceSeries = priceChart.addLineSeries({ color: "#f2c94c" })
+        const cvdSeries = cvdChart.addLineSeries({ color: "#56ccf2" })
 
-        function resize() {
-            priceChart.applyOptions({ width: priceEl.clientWidth, height: priceEl.clientHeight });
-            cvdChart.applyOptions({ width: cvdEl.clientWidth, height: cvdEl.clientHeight });
-        }
-        window.addEventListener("resize", resize);
+        let programmaticRangeChange = false
+        let syncing = false
+        let lastAfterFetchAt = 0
+        let lastBeforeFetchAt = 0
 
-        /* ---------- timeScale 同步（稳定版） ---------- */
-        let syncing = false;
         function sync(a, b) {
             a.timeScale().subscribeVisibleLogicalRangeChange(r => {
-                if (!r || syncing) return;
-                syncing = true; b.timeScale().setVisibleLogicalRange(r); syncing = false;
-            });
-        }
-        sync(priceChart, cvdChart);
-        sync(cvdChart, priceChart);
-
-        /* ---------- 时区 + 分钟刻度 ---------- */
-        let currentTz = tzSel.value;
-
-        function formatTime(sec) {
-            return new Intl.DateTimeFormat("en-GB", {
-                timeZone: currentTz === "local" ? undefined : currentTz,
-                month: "2-digit",
-                day: "2-digit",
-                hour: "2-digit",
-                minute: "2-digit",
-            }).format(new Date(sec * 1000));
+                if (programmaticRangeChange) return
+                if (!r || syncing) return
+                syncing = true
+                b.timeScale().setVisibleLogicalRange(r)
+                syncing = false
+            })
         }
 
-        function applyTz(chart) {
-            chart.applyOptions({
-                timeScale: { tickMarkFormatter: (t) => (typeof t === "number" ? formatTime(t) : "") }
-            });
-        }
+        sync(priceChart, cvdChart)
+        sync(cvdChart, priceChart)
 
-        applyTz(priceChart);
-        applyTz(cvdChart);
-
-        /* ---------- paging + in-memory ---------- */
-        // Page state
         const page = {
             bars: [],
             oldestTime: null,
-            loadingMore: false,
+            newestTime: null,
+            loadingOlder: false,
+            loadingNewer: false,
             reachedStart: false,
-            lastKey: "",
-        };
-
-        // ======== AUTO-FOLLOW (no button) ========
-        let isFollowing = true;           // start in follow mode
-        let programmaticScroll = false;   // prevent feedback loop
-        const FOLLOW_RIGHT_BARS = 5;      // "how close to right edge counts as live"
-
-        // 判断当前视窗是否已经贴近最右侧
-        function isNearRightEdge(chart) {
-            const r = chart.timeScale().getVisibleLogicalRange();
-            if (!r || !page.bars.length) return true;
-
-            // logical index roughly maps to data index (0..len-1)
-            const rightMostIdx = page.bars.length - 1;
-            return (rightMostIdx - r.to) <= FOLLOW_RIGHT_BARS;
+            reachedEnd: false
         }
-
-        // 只要用户把图拖回右边，就自动恢复 follow
-        priceChart.timeScale().subscribeVisibleLogicalRangeChange((r) => {
-            if (!r || programmaticScroll) return;
-
-            // 用户在操作导致的 range change：判断是否回到了右边
-            const nearRight = isNearRightEdge(priceChart);
-            isFollowing = nearRight;
-        });
 
         function setBars(bars, keepRange = null) {
-            page.bars = bars;
-            page.oldestTime = bars.length ? bars[0].time : null;
+            programmaticRangeChange = true
+            page.bars = bars
+            page.oldestTime = bars[0]?.time ?? null
+            page.newestTime = bars[bars.length - 1]?.time ?? null
 
-            priceSeries.setData(bars.map(b => ({ time: b.time, value: b.price_close })));
-            cvdSeries.setData(bars.map(b => ({ time: b.time, value: b.cvd_usdt })));
+            priceSeries.setData(bars.map(b => ({ time: b.time, value: b.price_close })))
+            cvdSeries.setData(bars.map(b => ({ time: b.time, value: b.cvd_usdt })))
 
-            if (keepRange) {
-                priceChart.timeScale().setVisibleLogicalRange(keepRange);
-            }
+            if (keepRange) priceChart.timeScale().setVisibleLogicalRange(keepRange)
+
+            requestAnimationFrame(() => programmaticRangeChange = false)
         }
 
-        function mergePrepend(currentBars, olderBars) {
-            if (!olderBars || olderBars.length === 0) return currentBars;
-
-            const curFirst = currentBars.length ? currentBars[0].time : null;
-            const filteredOlder = (curFirst == null)
-                ? olderBars
-                : olderBars.filter(b => b.time < curFirst);
-
-            const merged = [...filteredOlder, ...currentBars];
-
-            // 只有在实时模式下才限制容量
-            if (isFollowing && merged.length > CONFIG.MAX_CACHED_BARS) {
-                return merged.slice(merged.length - CONFIG.MAX_CACHED_BARS);
+        function trimToWindow(bars, oldRange) {
+            if (bars.length <= CONFIG.WINDOW_SIZE) return { bars, newRange: oldRange }
+            const start = bars.length - CONFIG.WINDOW_SIZE
+            const sliced = bars.slice(start)
+            let newRange = oldRange
+            if (oldRange) {
+                newRange = { from: oldRange.from - start, to: oldRange.to - start }
             }
-
-            return merged;
+            return { bars: sliced, newRange }
         }
 
-        // Fetch history with timeout and error handling
-        async function fetchHistory(exchange, symbol, market, tf, limit, before) {
-            const u = new URL(`${API}/history`, location.origin);
-            u.searchParams.set("exchange", exchange);
-            u.searchParams.set("symbol", symbol);
-            u.searchParams.set("market", market);
-            u.searchParams.set("tf", tf);
-            u.searchParams.set("limit", String(limit));
-            if (before != null) u.searchParams.set("before", String(before));
+        async function fetchHistory(exchange, symbol, market, tf, limit, before = null, after = null) {
+            const u = new URL("/history", location.origin)
+            u.searchParams.set("exchange", exchange)
+            u.searchParams.set("symbol", symbol)
+            u.searchParams.set("market", market)
+            u.searchParams.set("tf", tf)
+            u.searchParams.set("limit", limit)
+            if (before != null) u.searchParams.set("before", before)
+            if (after != null) u.searchParams.set("after", after)
+            const r = await fetch(u)
+            return r.ok ? await r.json() : []
+        }
+
+        async function loadInitial() {
+            const bars = await fetchHistory(exchangeSel.value, symbolSel.value, marketSel.value, tfSel.value, CONFIG.HISTORY_PAGE_SIZE)
+            setBars(bars || [])
+        }
+
+        async function loadMoreBefore() {
+            if (page.loadingOlder || page.reachedStart) return
+            if (!page.oldestTime) return
+
+            const now = Date.now()
+            if (now - lastBeforeFetchAt < 300) return
+            lastBeforeFetchAt = now
+
+            page.loadingOlder = true
+            const oldRange = priceChart.timeScale().getVisibleLogicalRange()
 
             try {
-                const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), CONFIG.FETCH_TIMEOUT);
-                const r = await fetch(u, { signal: controller.signal });
-                clearTimeout(timeout);
-                return r.ok ? await r.json() : [];
-            } catch (err) {
-                console.warn('Fetch error:', err.message);
-                return [];
+                const older = await fetchHistory(exchangeSel.value, symbolSel.value, marketSel.value, tfSel.value, CONFIG.HISTORY_PAGE_SIZE, page.oldestTime, null)
+                if (!older.length) { page.reachedStart = true; return }
+                const merged = [...older.filter(b => b.time < page.oldestTime), ...page.bars]
+                const trimmed = trimToWindow(merged, oldRange)
+                setBars(trimmed.bars, trimmed.newRange)
             }
+            finally { page.loadingOlder = false }
         }
 
-        async function loadInitial(exchange, symbol, market, tf) {
-            statusEl.textContent = "loading…";
-            page.loadingMore = false;
-            page.reachedStart = false;
+        async function loadMoreAfter() {
+            if (page.loadingNewer || page.reachedEnd) return
+            if (!page.newestTime) return
 
-            const bars = await fetchHistory(exchange, symbol, market, tf, CONFIG.HISTORY_PAGE_SIZE, null);
-            setBars(Array.isArray(bars) ? bars : []);
+            const now = Date.now()
+            if (now - lastAfterFetchAt < 300) return
+            lastAfterFetchAt = now
 
-            isFollowing = true;
-
-            priceChart.timeScale().scrollToRealTime();
-            statusEl.textContent = "live";
-        }
-
-        async function loadMoreBefore(exchange, symbol, market, tf) {
-            if (page.loadingMore || page.reachedStart) return;
-            if (!page.bars.length || page.oldestTime == null) return;
-
-            page.loadingMore = true;
-
-            const oldRange = priceChart.timeScale().getVisibleLogicalRange();
-            const oldLen = page.bars.length;
+            page.loadingNewer = true
+            const oldRange = priceChart.timeScale().getVisibleLogicalRange()
 
             try {
-                const older = await fetchHistory(exchange, symbol, market, tf, CONFIG.HISTORY_PAGE_SIZE, page.oldestTime);
-                const olderBars = Array.isArray(older) ? older : [];
-                if (!olderBars.length) { page.reachedStart = true; return; }
-
-                const merged = mergePrepend(page.bars, olderBars);
-                setBars(merged);
-
-                if (oldRange) {
-                    const delta = merged.length - oldLen;
-                    priceChart.timeScale().setVisibleLogicalRange({
-                        from: oldRange.from + delta,
-                        to: oldRange.to + delta,
-                    });
-                }
-            } finally {
-                page.loadingMore = false;
+                const newer = await fetchHistory(exchangeSel.value, symbolSel.value, marketSel.value, tfSel.value, CONFIG.HISTORY_PAGE_SIZE, null, page.newestTime)
+                if (!newer.length) { page.reachedEnd = true; return }
+                const merged = [...page.bars, ...newer.filter(b => b.time > page.newestTime)]
+                const trimmed = trimToWindow(merged, oldRange)
+                setBars(trimmed.bars, trimmed.newRange)
             }
+            finally { page.loadingNewer = false }
         }
 
-        // Load more bars when scrolling to the left edge
-        priceChart.timeScale().subscribeVisibleLogicalRangeChange((r) => {
-            if (!r) return;
-            if (r.from <= CONFIG.LOAD_TRIGGER) {
-                loadMoreBefore(exchangeSel.value, symbolSel.value, marketSel.value, tfSel.value);
-            }
-        });
+        priceChart.timeScale().subscribeVisibleLogicalRangeChange(r => {
+            if (programmaticRangeChange) return
+            if (!r || !page.bars.length) return
 
-        // ==================== WEBSOCKET ====================
-        let ws = null;
-        let wsWant = {};
-        let lastWsTime = 0;
-        let wsReconnectAttempts = 0;
-        let wsReconnectTimeout = null;
+            if (r.from <= CONFIG.EDGE_TRIGGER) loadMoreBefore()
 
-        function closeWs() {
-            if (ws) {
-                try {
-                    ws.onopen = ws.onclose = ws.onmessage = ws.onerror = null;
-                    ws.close();
-                } catch { }
-                ws = null;
-            }
-            if (wsReconnectTimeout) clearTimeout(wsReconnectTimeout);
-        }
+            const maxIndex = page.bars.length - 1
+            const rightIndex = Math.min(r.to, maxIndex)
+            const rightGap = maxIndex - rightIndex
 
-        function connectWs(exchange, symbol, market, tf) {
-            const wantKey = `${exchange}|${symbol}|${market}|${tf}`;
-            if (wsWant.key === wantKey && ws && ws.readyState === WebSocket.OPEN) {
-                return; // Already connected
-            }
+            if (rightGap <= CONFIG.EDGE_TRIGGER) loadMoreAfter()
+        })
 
-            wsWant = { exchange, symbol, market, tf, key: wantKey };
-            lastWsTime = 0;
-            wsReconnectAttempts = 0;
+        loadInitial()
 
-            closeWs();
-
-            const proto = location.protocol === "https:" ? "wss" : "ws";
-            ws = new WebSocket(`${proto}://${location.host}${API}/ws?exchange=${exchange}&symbol=${symbol}&market=${market}&tf=${tf}`);
-            statusEl.textContent = "connecting…";
-
-            ws.onopen = () => {
-                wsReconnectAttempts = 0;
-                statusEl.textContent = "live";
-            };
-
-            ws.onmessage = (ev) => {
-                if (wsWant.key !== wantKey) return; // Ignore if no longer wanted
-
-                let b;
-                try {
-                    b = JSON.parse(ev.data);
-                } catch (err) {
-                    console.warn('JSON parse error:', err.message);
-                    return;
-                }
-                if (typeof b.time !== "number") return;
-
-                if (b.time < lastWsTime) return; // Ignore out-of-order messages
-                lastWsTime = b.time;
-
-                const bars = page.bars;
-                const last = bars[bars.length - 1];
-
-                if (last && last.time === b.time) {
-                    bars[bars.length - 1] = b; // Update existing
-                } else if (!last || b.time > last.time) {
-                    bars.push(b); // Append new
-                    if (isFollowing && bars.length > CONFIG.MAX_CACHED_BARS) bars.shift();
-                }
-
-                if (typeof b.price_close === "number") priceSeries.update({ time: b.time, value: b.price_close });
-                if (typeof b.cvd_usdt === "number") cvdSeries.update({ time: b.time, value: b.cvd_usdt });
-
-                page.oldestTime = bars.length ? bars[0].time : null;
-
-                // 如果处于 follow 模式，让图自动贴住最新
-                if (isFollowing) {
-                    programmaticScroll = true;
-                    // 用 requestAnimationFrame 避免 setData/update 后立即滚动导致抖动
-                    requestAnimationFrame(() => {
-                        priceChart.timeScale().scrollToRealTime();
-                        programmaticScroll = false;
-                    });
-                }
-            };
-
-            ws.onerror = (err) => {
-                console.error('WebSocket error:', err);
-                statusEl.textContent = "error";
-            };
-
-            ws.onclose = () => {
-                if (wsWant.key !== wantKey) return; // Already switched
-                wsReconnectAttempts++;
-                if (wsReconnectAttempts <= CONFIG.WS_MAX_RECONNECT_ATTEMPTS) {
-                    statusEl.textContent = `reconnecting (${wsReconnectAttempts}/${CONFIG.WS_MAX_RECONNECT_ATTEMPTS})…`;
-                    wsReconnectTimeout = setTimeout(
-                        () => connectWs(exchange, symbol, market, tf),
-                        CONFIG.WS_RECONNECT_DELAY
-                    );
-                } else {
-                    statusEl.textContent = "disconnected";
-                }
-            };
-        }
-
-        // ==================== PERSISTENCE ====================
-        function savePreferences() {
-            const prefs = {
-                exchange: exchangeSel.value,
-                symbol: symbolSel.value,
-                market: marketSel.value,
-                tf: tfSel.value,
-                tz: tzSel.value,
-            };
-            localStorage.setItem(CONFIG.STORAGE_KEY_PREFIX + 'prefs', JSON.stringify(prefs));
-        }
-
-        function loadPreferences() {
-            const stored = localStorage.getItem(CONFIG.STORAGE_KEY_PREFIX + 'prefs');
-            if (!stored) return;
-            try {
-                const prefs = JSON.parse(stored);
-                if (prefs.exchange && EXCHANGE_CONFIG[prefs.exchange]) exchangeSel.value = prefs.exchange;
-                updateMarketOptions();
-                if (prefs.market && prefs.market !== marketSel.value) marketSel.value = prefs.market;
-                if (prefs.symbol && prefs.symbol !== symbolSel.value) symbolSel.value = prefs.symbol;
-                if (prefs.tf) tfSel.value = prefs.tf;
-                if (prefs.tz) tzSel.value = prefs.tz;
-            } catch (err) {
-                console.warn('Failed to load preferences:', err);
-            }
-        }
-
-        // ==================== RELOAD & LISTENERS ====================
-        async function reload() {
-            const e = exchangeSel.value, s = symbolSel.value, m = marketSel.value, tf = tfSel.value;
-            const key = `${e}|${s}|${m}|${tf}`;
-            if (page.lastKey !== key) {
-                page.lastKey = key;
-                page.bars = [];
-                page.oldestTime = null;
-                page.loadingMore = false;
-                page.reachedStart = false;
-            }
-            savePreferences();
-            updateTitle();
-            await loadInitial(e, s, m, tf);
-            connectWs(e, s, m, tf);
-        }
-
-        function updateTitle() {
-            const e = exchangeSel.value.toUpperCase();
-            const s = symbolSel.value;
-            const m = marketSel.value.toUpperCase();
-            const tf = tfSel.value;
-            document.title = `${s} ${m} (${e}) ${tf}`;
-        }
-
-        exchangeSel.onchange = () => {
-            updateMarketOptions();
-            reload();
-        };
-        symbolSel.onchange = reload;
-        marketSel.onchange = reload;
-        tfSel.onchange = reload;
-        tzSel.onchange = () => {
-            currentTz = tzSel.value;
-            savePreferences();
-            applyTz(priceChart);
-            applyTz(cvdChart);
-        };
-
-        // Initialize: load saved preferences, then reload
-        loadPreferences();
-        updateMarketOptions();
-        updateTitle();
-        reload();
-
-        /* ---------- screenshot (方案 B：合成一张) ---------- */
-        function screenshotBoth() {
-            const c1 = priceChart.takeScreenshot();
-            const c2 = cvdChart.takeScreenshot();
-
-            const w = Math.max(c1.width, c2.width);
-            const h = c1.height + c2.height;
-
-            const out = document.createElement("canvas");
-            out.width = w;
-            out.height = h;
-
-            const ctx = out.getContext("2d");
-            // 背景色，避免透明
-            ctx.fillStyle = "#111";
-            ctx.fillRect(0, 0, w, h);
-
-            ctx.drawImage(c1, 0, 0);
-            ctx.drawImage(c2, 0, c1.height);
-
-            const a = document.createElement("a");
-            a.download = `cvd_${exchangeSel.value}_${symbolSel.value}_${marketSel.value}_${tfSel.value}.png`;
-            a.href = out.toDataURL("image/png");
-            a.click();
-        }
-
-        // ==================== KEYBOARD SHORTCUTS ====================
-        document.addEventListener('keydown', (e) => {
-            // Alt+E: focus on exchange selector
-            if (e.altKey && e.key === 'e') {
-                e.preventDefault();
-                exchangeSel.focus();
-            }
-            // Alt+S: focus on symbol selector
-            if (e.altKey && e.key === 's') {
-                e.preventDefault();
-                symbolSel.focus();
-            }
-            // Alt+T: focus on timeframe selector
-            if (e.altKey && e.key === 't') {
-                e.preventDefault();
-                tfSel.focus();
-            }
-            // Alt+P: take screenshot
-            if (e.altKey && e.key === 'p') {
-                e.preventDefault();
-                screenshotBoth();
-            }
-        });
-
-        document.getElementById("shotAll").onclick = screenshotBoth;
     </script>
 </body>
 

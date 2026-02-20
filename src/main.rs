@@ -106,6 +106,7 @@ struct Params {
     tf: Option<String>,
     limit: Option<usize>,
     before: Option<i64>,
+    after: Option<i64>,
 }
 
 // ==============================
@@ -198,8 +199,14 @@ async fn load_history_page(
     tf: &str,
     limit: usize,
     before: Option<i64>,
+    after: Option<i64>,
 ) -> Result<Vec<Bar>> {
     let limit = limit.clamp(1, HISTORY_CAPACITY);
+
+    // 同时传 before + after 直接拒绝，避免歧义
+    if before.is_some() && after.is_some() {
+        anyhow::bail!("before and after cannot both be set");
+    }
 
     let rows: Vec<models::BarRow> = if let Some(before_ts) = before {
         sqlx::query_as(
@@ -217,6 +224,26 @@ async fn load_history_page(
         .bind(market)
         .bind(tf)
         .bind(before_ts)
+        .bind(limit as i64)
+        .fetch_all(db)
+        .await?
+    } else if let Some(after_ts) = after {
+        // ✅ 往右补：用 ASC
+        sqlx::query_as(
+            r#"
+            SELECT time, price_close, delta_usdt, cvd_usdt, trades
+            FROM bars
+            WHERE exchange = $1 AND symbol = $2 AND market = $3 AND tf = $4
+              AND time > $5
+            ORDER BY time ASC
+            LIMIT $6
+            "#,
+        )
+        .bind(exchange)
+        .bind(symbol)
+        .bind(market)
+        .bind(tf)
+        .bind(after_ts)
         .bind(limit as i64)
         .fetch_all(db)
         .await?
@@ -239,7 +266,23 @@ async fn load_history_page(
         .await?
     };
 
-    let (v, _) = convert_rows_to_bars(rows);
+    // before/none 分支是 DESC，要反转；after 分支是 ASC，不用反转
+    let mut v: Vec<Bar> = rows
+        .into_iter()
+        .map(|r| Bar {
+            time: r.time,
+            price_close: r.price_close,
+            delta_usdt: r.delta_usdt,
+            cvd_usdt: r.cvd_usdt,
+            trades: r.trades as u64,
+        })
+        .collect();
+
+    // 只有 before/none 才 reverse
+    if after.is_none() {
+        v.reverse();
+    }
+
     Ok(v)
 }
 
@@ -336,8 +379,9 @@ async fn history(State(state): State<Arc<AppState>>, Query(p): Query<Params>) ->
     let tf = p.tf.as_deref().unwrap_or("1m");
     let limit = p.limit.unwrap_or(800).min(HISTORY_CAPACITY);
     let before = p.before;
+    let after = p.after;
 
-    match load_history_page(&state.db, exchange, symbol, market, tf, limit, before).await {
+    match load_history_page(&state.db, exchange, symbol, market, tf, limit, before, after).await {
         Ok(bars) => Json(bars).into_response(),
         Err(e) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
